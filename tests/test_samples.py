@@ -51,6 +51,8 @@ def _ensure_samples():
         SAMPLES / "Test_Empty.xlsm",
         SAMPLES / "Test_BinaryMacro.xlsb",
         SAMPLES / "Test_AlreadyClean.xlsm",
+        SAMPLES / "Test_LargeModule.xlsm",
+        SAMPLES / "Test_ClassAndSheets.xlsm",
     ]
     missing = [p for p in expected if not p.exists()]
     if not missing:
@@ -150,6 +152,37 @@ class TestBinaryMacro(unittest.TestCase):
         code, out = _run_clean(src)
         self.assertEqual(code, 0)
         # Should either modify or at least detect macros
+        self.assertTrue(
+            ("P-code removed from modules" in out)
+            or ("VBA macros detected" in out)
+            or ("dir stream could not be parsed" in out)
+            or ("applied heuristic patch" in out),
+            msg=f"Unexpected output: {out}",
+        )
+
+
+@unittest.skipUnless((SAMPLES / "Test_LargeModule.xlsm").exists(), "Sample not present - run scripts/generate_samples.py")
+class TestLargeModule(unittest.TestCase):
+    def test_large_module_detects_macros(self):
+        src = SAMPLES / "Test_LargeModule.xlsm"
+        code, out = _run_clean(src)
+        self.assertEqual(code, 0)
+        # We at least expect macro detection; many environments will also remove P-code
+        self.assertTrue(
+            ("P-code removed from modules" in out)
+            or ("VBA macros detected" in out)
+            or ("dir stream could not be parsed" in out)
+            or ("applied heuristic patch" in out),
+            msg=f"Unexpected output: {out}",
+        )
+
+
+@unittest.skipUnless((SAMPLES / "Test_ClassAndSheets.xlsm").exists(), "Sample not present - run scripts/generate_samples.py")
+class TestClassAndSheets(unittest.TestCase):
+    def test_class_and_sheets_detects_macros(self):
+        src = SAMPLES / "Test_ClassAndSheets.xlsm"
+        code, out = _run_clean(src)
+        self.assertEqual(code, 0)
         self.assertTrue(
             ("P-code removed from modules" in out)
             or ("VBA macros detected" in out)

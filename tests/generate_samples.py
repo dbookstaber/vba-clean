@@ -11,6 +11,8 @@ MULTI_XLSM = SAMPLES_DIR / "Test_MultiModule.xlsm"  # Ideally should contain P-c
 EMPTY_XLSM = SAMPLES_DIR / "Test_Empty.xlsm"
 BINARY_XLSB = SAMPLES_DIR / "Test_BinaryMacro.xlsb"  # Ideally should contain P-code
 CLEANED_XLSM = SAMPLES_DIR / "Test_AlreadyClean.xlsm"
+LARGE_XLSM = SAMPLES_DIR / "Test_LargeModule.xlsm"  # Large, low-compressibility module
+CLASS_SHEETS_XLSM = SAMPLES_DIR / "Test_ClassAndSheets.xlsm"  # Class + multiple sheet code-behind
 
 INTRO = """
 This script generates macro-enabled Excel workbooks for integration testing.
@@ -52,6 +54,17 @@ def _add_std_module(wb: xw.Book, name: str, code: str) -> None:
     vbcomp.CodeModule.AddFromString(code)
 
 
+def _add_std_module_chunked(wb: xw.Book, name: str, lines: list[str], chunk_size: int = 400) -> None:
+    """Add a large standard module in chunks to avoid COM/VBA memory errors."""
+    vbcomp = wb.api.VBProject.VBComponents.Add(1)
+    vbcomp.Name = name
+    # Start with Option Explicit
+    vbcomp.CodeModule.AddFromString("Option Explicit\n")
+    for i in range(0, len(lines), chunk_size):
+        batch = "\n".join(lines[i:i+chunk_size])
+        vbcomp.CodeModule.AddFromString(batch + "\n")
+
+
 def _add_class_module(wb: xw.Book, name: str, code: str) -> None:
     vbcomp = wb.api.VBProject.VBComponents.Add(2)  # 2: vbext_ct_ClassModule
     vbcomp.Name = name
@@ -66,6 +79,24 @@ def _add_sheet_code(wb: xw.Book, sheet_index: int, code: str) -> None:
 def _save(wb: xw.Book, path: Path, fileformat: int) -> None:
     # 52: xlsm, 50: xlsb
     wb.api.SaveAs(str(path), FileFormat=fileformat)
+
+
+def _encourage_compilation(app: xw.App, wb: xw.Book) -> None:
+    """Try a few tricks to make Excel compile VBA modules and emit P-code."""
+    try:
+        # Toggle a trivial code change to trigger compile
+        for vbcomp in wb.api.VBProject.VBComponents:
+            cm = vbcomp.CodeModule
+            if cm.CountOfLines > 0:
+                first = cm.Lines(1, 1)
+                cm.ReplaceLine(1, first)
+    except Exception:
+        pass
+    try:
+        # Try running a known macro name if present
+        app.api.Run("ForceCompile")
+    except Exception:
+        pass
 
 
 def _try_run_macro(app: xw.App, macro_name: str) -> None:
@@ -96,6 +127,7 @@ End Sub
     )
     _save(wb, SIMPLE_XLSM, 52)
     _try_run_macro(app, "Module1.ForceCompile")
+    _encourage_compilation(app, wb)
     wb.api.Save()
     wb.close()
 
@@ -148,6 +180,7 @@ End Sub
     )
     _save(wb, MULTI_XLSM, 52)
     _try_run_macro(app, "Runner.Run")
+    _encourage_compilation(app, wb)
     wb.api.Save()
     wb.close()
 
@@ -194,6 +227,76 @@ End Sub
         _try_run_macro(app, "BinWarm.ForceCompile")
     except Exception:
         pass
+    _encourage_compilation(app, wb)
+    wb.api.Save()
+    wb.close()
+
+
+def create_large_xlsm(app: xw.App) -> None:
+    """Create a workbook with a very large, low-compressibility module to force many chunks.
+
+    We generate thousands of unique lines to defeat LZ compression and aim for
+    uncompressed chunks, increasing the chance of short final uncompressed chunks.
+    """
+    if LARGE_XLSM.exists():
+        LARGE_XLSM.unlink()
+    wb = _new_wb(app)
+    # Build a big module with pseudo-random-like lines
+    lines = []
+    # Keep below COM memory limits by batching; total lines still large
+    for i in range(1, 12000):  # ~12k lines -> sizable module
+        # Each line ~60-80 bytes with varying numbers to reduce repetition
+        lines.append(f"Sub N{i}(): Dim a{i} As String: a{i} = \"{i:06d}X{i*i%9973:04d}Y{i*7%1234:04d}Z\": End Sub")
+    _add_std_module_chunked(wb, "BigMod", lines, chunk_size=300)
+    _save(wb, LARGE_XLSM, 52)
+    _encourage_compilation(app, wb)
+    wb.api.Save()
+    wb.close()
+
+
+def create_class_and_sheets_xlsm(app: xw.App) -> None:
+    """Create a workbook with a class module and code in multiple sheets."""
+    if CLASS_SHEETS_XLSM.exists():
+        CLASS_SHEETS_XLSM.unlink()
+    wb = _new_wb(app)
+    # Add two sheets to get multiple code-behind modules
+    wb.sheets.add(after=wb.sheets[0])
+    wb.sheets.add(after=wb.sheets[1])
+    # Class module
+    _add_class_module(
+        wb,
+        "Worker",
+        """
+Option Explicit
+Private m_Id As Long
+Public Property Get Id() As Long: Id = m_Id: End Property
+Public Property Let Id(ByVal v As Long): m_Id = v: End Property
+Public Function Work(ByVal x As Long) As Long: Work = x * 2: End Function
+""".strip(),
+    )
+    # Sheet code-behind on two sheets
+    _add_sheet_code(
+        wb,
+        0,
+        """
+Option Explicit
+Private Sub Worksheet_SelectionChange(ByVal Target As Range)
+    ' No-op
+End Sub
+""".strip(),
+    )
+    _add_sheet_code(
+        wb,
+        1,
+        """
+Option Explicit
+Private Sub Worksheet_Activate()
+    ' No-op
+End Sub
+""".strip(),
+    )
+    _save(wb, CLASS_SHEETS_XLSM, 52)
+    _encourage_compilation(app, wb)
     wb.api.Save()
     wb.close()
 
@@ -241,6 +344,8 @@ def main() -> None:
         create_multi_xlsm(app)
         create_empty_xlsm(app)
         create_binary_xlsb(app)
+        create_large_xlsm(app)
+        create_class_and_sheets_xlsm(app)
         create_already_clean(app)
         print(f"Samples written to: {SAMPLES_DIR}")
     finally:

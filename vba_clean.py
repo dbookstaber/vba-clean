@@ -690,6 +690,9 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
     repacked_modules: Set[str] = set()
     vba_changed = False
 
+    # First pass: decide per-module action and build new payloads
+    planned_writes: Dict[Tuple[str, str], bytes] = {}
+
     # Enumerate module streams
     special = {"dir", "project", "_vba_project", "projectwm"}
     for entry in ole.listdir():
@@ -721,29 +724,99 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
             text_bytes = decomp[text_off:]
             rebuilt = _compress_uncompressed(text_bytes)
             if rebuilt != data:
-                try:
-                    ole.write_stream(sp, rebuilt)
-                    modifications[name] = 0
-                    repacked_modules.add(name)
-                    vba_changed = True
-                except ValueError:
-                    # olefile cannot resize streams; fall back to size-preserving neutralisation
-                    patched = zero_pcode_region(data, text_off)
-                    if patched != data:
-                        ole.write_stream(sp, patched)
-                        modifications[name] = text_off
-                        vba_changed = True
-
-    # Try to zero ModuleOffset in dir for repacked modules
-    if repacked_modules:
-        new_dir_comp, changed = _update_dir_offsets_to_zero(dir_comp, repacked_modules)
-        if changed:
-            try:
-                ole.write_stream(dir_stream_path, new_dir_comp)
-            except ValueError:
-                # Cannot resize dir stream; leave as-is (Excel typically tolerates this)
+                # Defer actual write; try to repack (resize) later as a batch
+                planned_writes[tuple(sp)] = rebuilt
+            else:
+                # No change needed
                 pass
 
+    # If there are planned resizes, attempt them. Strategy:
+    # 1) Try in-memory writes (may fail for resized streams)
+    # 2) If any ValueError arises, retry all writes using a temp on-disk file where olefile supports resizing
+    dir_replacement: Optional[bytes] = None
+    if planned_writes:
+        # Determine which modules are to be repacked (ModuleOffset -> 0)
+        repacked_modules = {name for (_, name) in planned_writes.keys() if _ == 'VBA'}
+        new_dir_comp, dir_changed = _update_dir_offsets_to_zero(dir_comp, repacked_modules)
+        if dir_changed:
+            dir_replacement = new_dir_comp
+
+        def try_apply_writes(o: "olefile.OleFileIO") -> Optional[Exception]:
+            try:
+                # Apply module writes first
+                for sp_tuple, payload in planned_writes.items():
+                    o.write_stream(list(sp_tuple), payload)
+                # Then dir if needed
+                if dir_replacement is not None:
+                    o.write_stream(dir_stream_path, dir_replacement)
+                return None
+            except Exception as e:  # catch and return to decide fallback
+                return e
+
+        err = try_apply_writes(ole)
+        if err is None:
+            # In-memory resize succeeded
+            for (_, name), _payload in planned_writes.items():
+                modifications[name] = 0
+            vba_changed = True
+            ole.close()
+            bio.seek(0)
+            return bio.read(), modifications, modules_seen, parse_ok, vba_changed
+        else:
+            # Fallback: recreate using a temp file on disk
+            ole.close()
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                tf.write(project_bytes)
+                tmp_path = tf.name
+            try:
+                o2 = olefile.OleFileIO(tmp_path, write_mode=True)
+                err2 = try_apply_writes(o2)
+                o2.close()
+                if err2 is None:
+                    with open(tmp_path, 'rb') as fh:
+                        project_bytes = fh.read()
+                    # Mark modifications and flags based on planned writes
+                    for (_, name), _payload in planned_writes.items():
+                        modifications[name] = 0
+                        vba_changed = True
+                    if dir_replacement is not None:
+                        # ensure parse_ok propagated above; nothing else to do
+                        pass
+                    # Return early with updated bytes
+                    return project_bytes, modifications, modules_seen, parse_ok, True
+                else:
+                    # Fall through to neutralization path below
+                    pass
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        # If we reach here, resized writes failed both in-memory and on-disk. Fall back per-module.
+        # Re-open original in-memory OLE to apply size-preserving neutralisation.
+        bio = io.BytesIO(project_bytes)
+        ole = olefile.OleFileIO(bio, write_mode=True)
+        for sp_tuple, _payload in planned_writes.items():
+            name = sp_tuple[1]
+            sp = list(sp_tuple)
+            try:
+                data = ole.openstream(sp).read()
+            except Exception:
+                continue
+            text_off = offsets_map.get(name)
+            if text_off is None:
+                text_off = _guess_text_offset(data)
+            if text_off is None:
+                continue
+            patched = zero_pcode_region(data, text_off)
+            if patched != data:
+                ole.write_stream(sp, patched)
+                modifications[name] = text_off
+                vba_changed = True
+
+    # If no planned resizes or after fallback neutralisation, finalise current in-memory OLE
     ole.close()
     bio.seek(0)
     return bio.read(), modifications, modules_seen, parse_ok, vba_changed
