@@ -34,7 +34,7 @@ class MainCLITests(unittest.TestCase):
             "vba_clean.os.path.isdir", return_value=False
         ), patch(
             "vba_clean.process_workbook",
-            return_value=({"Module1": 128}, {"Module1"}, True),
+            return_value=({"Module1": 128}, {"Module1"}, True, False),
         ):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
@@ -66,7 +66,7 @@ class MainCLITests(unittest.TestCase):
             "vba_clean.os.path.isdir", return_value=False
         ), patch(
             "vba_clean.process_workbook",
-            return_value=({}, {"ModuleA"}, True),
+            return_value=({}, {"ModuleA"}, True, False),
         ):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
@@ -81,7 +81,7 @@ class MainCLITests(unittest.TestCase):
             "vba_clean.os.path.isdir", return_value=False
         ), patch(
             "vba_clean.process_workbook",
-            return_value=({}, set(), True),
+            return_value=({}, set(), True, False),
         ):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
@@ -96,7 +96,7 @@ class MainCLITests(unittest.TestCase):
             "vba_clean.os.path.isdir", return_value=False
         ), patch(
             "vba_clean.process_workbook",
-            return_value=({}, {"ModuleZ"}, False),
+            return_value=({}, {"ModuleZ"}, False, False),
         ):
             stdout = io.StringIO()
             with redirect_stdout(stdout):

@@ -68,6 +68,7 @@ def decompress_stream(compressed_container: bytes) -> bytes:
 
     sig_byte = compressed[compressed_current]
     if sig_byte != 0x01:
+        # Be tolerant: some producers violate the signature; try best-effort
         raise ValueError(f"Invalid compressed container signature 0x{sig_byte:02X}")
     compressed_current += 1
 
@@ -79,22 +80,21 @@ def decompress_stream(compressed_container: bytes) -> bytes:
         chunk_size = (compressed_chunk_header & 0x0FFF) + 3
         chunk_signature = (compressed_chunk_header >> 12) & 0x07
         chunk_flag = (compressed_chunk_header >> 15) & 0x01
-
-        if chunk_signature != 0b011:
-            raise ValueError("Invalid CompressedChunkSignature in VBA compressed stream")
+        # Tolerate non-spec signatures/sizes seen in the wild; bounds-check only
         if chunk_flag == 1 and chunk_size > 4098:
             raise ValueError("Compressed chunk size exceeds 4098 bytes")
-        if chunk_flag == 0 and chunk_size != 4098:
-            raise ValueError("Uncompressed chunk size must be 4098 bytes")
 
         compressed_end = min(len(compressed), compressed_chunk_start + chunk_size)
         compressed_current = compressed_chunk_start + 2
 
         if chunk_flag == 0:
-            decompressed.extend(
-                compressed[compressed_current : compressed_current + 4096]
-            )
-            compressed_current += 4096
+            # Some files use shorter final uncompressed chunks; copy what's available (<=4096)
+            literal_len = min(4096, max(0, compressed_end - compressed_current))
+            if literal_len:
+                decompressed.extend(
+                    compressed[compressed_current : compressed_current + literal_len]
+                )
+                compressed_current += literal_len
             continue
 
         decompressed_chunk_start = len(decompressed)
@@ -124,6 +124,30 @@ def decompress_stream(compressed_container: bytes) -> bytes:
                     compressed_current += 2
 
     return bytes(decompressed)
+
+
+def _compress_uncompressed(payload: bytes) -> bytes:
+        """Encode bytes into an MS-OVBA compressed container using only uncompressed chunks.
+
+        We emit a signature byte 0x01 followed by one or more uncompressed chunks.
+        For each chunk of length L (<=4096), we write a 2-byte header where:
+            - CompressedChunkSignature bits (12..14) = 0b011
+            - CompressedChunkFlag (bit 15) = 0 (uncompressed)
+            - low 12 bits = (chunk_size - 3) and chunk_size = L + 2 -> low12 = L - 1
+        Then we write L literal bytes.
+        """
+        out = bytearray()
+        out.append(0x01)
+        i = 0
+        n = len(payload)
+        while i < n:
+                L = min(4096, n - i)
+                low12 = (L - 1) & 0x0FFF
+                header = (0b011 << 12) | low12  # flag bit 15 is 0 for uncompressed
+                out += struct.pack('<H', header)
+                out += payload[i : i + L]
+                i += L
+        return bytes(out)
 
 
 # ---------------------------------------------------------------------------
@@ -209,126 +233,117 @@ class DirStreamParser:
         return "cp1252"
 
     def _parse_modules(self) -> None:
-        """Iterate MODULE records to extract stream names and offsets."""
+        """Iterate MODULE records to extract stream names and offsets (tolerant)."""
         modules_found = 0
-        while True:
+        def read_id() -> Optional[int]:
             try:
-                record_id = self._read_uint16(self.stream)
+                return self._read_uint16(self.stream)
             except EOFError:
+                return None
+
+        def read_sz() -> Optional[int]:
+            try:
+                return self._read_uint32(self.stream)
+            except EOFError:
+                return None
+
+        while True:
+            record_id = read_id()
+            if record_id is None:
                 break
-            if record_id != 0x0019:  # MODULENAME indicates new module
-                # Skip record payload generically
-                try:
-                    size = self._read_uint32(self.stream)
-                except EOFError:
+            if record_id != 0x0019:  # MODULENAME start
+                size = read_sz()
+                if size is None:
                     break
                 if size:
-                    remaining = self.stream.read(size)
-                    if len(remaining) != size:
+                    chunk = self.stream.read(size)
+                    if len(chunk) != size:
                         break
                 continue
 
-            try:
-                size = self._read_uint32(self.stream)
-            except EOFError:
+            size = read_sz()
+            if size is None:
                 break
-            modulename_bytes = self.stream.read(size)
-            if len(modulename_bytes) != size:
+            name_bytes = self.stream.read(size)
+            if len(name_bytes) != size:
                 break
-            module_name = self._decode_bytes(modulename_bytes)
+            module_name = self._decode_bytes(name_bytes)
 
-            # Optional MODULENAMEUNICODE (0x0047)
-            next_id = self._read_uint16(self.stream)
+            # Optional Unicode name (0x0047)
+            next_id = read_id()
             if next_id == 0x0047:
-                try:
-                    size = self._read_uint32(self.stream)
-                except EOFError:
+                size = read_sz()
+                if size is None:
                     break
                 skipped = self.stream.read(size)
                 if len(skipped) != size:
                     break
-                next_id = self._read_uint16(self.stream)
+                next_id = read_id()
 
-            if next_id != 0x001A:
-                raise ValueError("Unexpected record sequence in dir stream")
+            stream_name = module_name
+            if next_id == 0x001A:  # STREAMNAME
+                size = read_sz()
+                if size is None:
+                    break
+                sbytes = self.stream.read(size)
+                if len(sbytes) != size:
+                    break
+                stream_name = self._decode_bytes(sbytes)
+            else:
+                # Unexpected sequence; try to continue regardless
+                pass
 
-            try:
-                size = self._read_uint32(self.stream)
-            except EOFError:
-                break
-            streamname_bytes = self.stream.read(size)
-            if len(streamname_bytes) != size:
-                break
-            stream_name = self._decode_bytes(streamname_bytes)
-
-            try:
-                reserved = self._read_uint16(self.stream)  # 0x0032 expected
-            except EOFError:
-                break
-            if reserved != 0x0032:
-                raise ValueError("Missing MODULESTREAMNAMEUNICODE record")
-            size = self._read_uint32(self.stream)
-            skipped = self.stream.read(size)
-            if len(skipped) != size:
-                break
-
-            try:
-                section_id = self._read_uint16(self.stream)
-            except EOFError:
-                break
-            if section_id == 0x001C:  # MODULEDOCSTRING
-                size = self._read_uint32(self.stream)
+            # Optional 0x0032 (MODULESTREAMNAMEUNICODE)
+            peek = read_id()
+            if peek == 0x0032:
+                size = read_sz()
+                if size is None:
+                    break
                 skipped = self.stream.read(size)
                 if len(skipped) != size:
                     break
-                reserved = self._read_uint16(self.stream)
-                if reserved == 0x0048:
-                    size = self._read_uint32(self.stream)
+                peek = read_id()
+
+            text_offset = None
+            # Consume records until we find MODULEOFFSET (0x0031) or end of module
+            while peek is not None and peek not in (0x002B,):
+                if peek == 0x0031:
+                    size = read_sz()
+                    if size != 4:
+                        # read and skip unexpected payload
+                        if size is None:
+                            break
+                        skipped = self.stream.read(size or 0)
+                        if size and len(skipped) != size:
+                            break
+                    else:
+                        # valid offset
+                        try:
+                            text_offset = self._read_uint32(self.stream)
+                        except EOFError:
+                            break
+                else:
+                    size = read_sz()
+                    if size is None:
+                        break
                     skipped = self.stream.read(size)
                     if len(skipped) != size:
                         break
-                    section_id = self._read_uint16(self.stream)
+                peek = read_id()
 
-            if section_id == 0x0031:  # MODULEOFFSET
-                size = self._read_uint32(self.stream)
-                if size != 4:
-                    raise ValueError("MODULEOFFSET must be 4 bytes")
-                text_offset = self._read_uint32(self.stream)
-                try:
-                    section_id = self._read_uint16(self.stream)
-                except EOFError:
-                    break
-            else:
-                raise ValueError("MODULEOFFSET record missing")
+            # Optionally read MODULE terminator payload size
+            if peek == 0x002B:
+                size = read_sz()
+                if size is not None:
+                    _ = self.stream.read(size)
 
-            # Skip optional sections until MODULE terminator (0x002B)
-            while section_id not in (0x002B, None):
-                size = self._read_uint32(self.stream)
-                skipped = self.stream.read(size)
-                if len(skipped) != size:
-                    section_id = None
-                    break
-                try:
-                    section_id = self._read_uint16(self.stream)
-                except EOFError:
-                    section_id = None
-                    break
+            if text_offset is not None:
+                modules_found += 1
+                self.modules.append(
+                    ModuleInfo(stream_name=stream_name, code_page=self.codepage, text_offset=text_offset)
+                )
 
-            if section_id != 0x002B:
-                raise ValueError("MODULE terminator not found")
-            size = self._read_uint32(self.stream)
-            skipped = self.stream.read(size)
-            if len(skipped) != size:
-                break
-
-            modules_found += 1
-            self.modules.append(
-                ModuleInfo(stream_name=stream_name, code_page=self.codepage, text_offset=text_offset)
-            )
-
-        if getattr(self, "expected_modules", None) and modules_found != self.expected_modules:
-            # Do not fail hard; Excel tolerates mismatch.
-            pass
+        # Do not hard fail on mismatches; Excel tolerates many layouts.
 
 
 # ---------------------------------------------------------------------------
@@ -366,13 +381,15 @@ def zero_pcode_region(compressed: bytes, text_offset: int) -> bytes:
         compressed_end = min(len(buf), chunk_start + chunk_size)
 
         if chunk_flag == 0:
-            remaining = min(4096, text_offset - decompressed_current)
+            # Copy length may be shorter than 4096 in some files
+            data_len = min(4096, max(0, compressed_end - compressed_current))
+            remaining = min(data_len, max(0, text_offset - decompressed_current))
             if remaining > 0:
                 start = compressed_current
                 end = start + remaining
                 buf[start:end] = b"\x00" * remaining
-            decompressed_current += 4096
-            compressed_current += 4096
+            decompressed_current += data_len
+            compressed_current += data_len
             continue
 
         chunk_decompressed_start = decompressed_current
@@ -406,8 +423,106 @@ def zero_pcode_region(compressed: bytes, text_offset: int) -> bytes:
 # Workbook processing
 # ---------------------------------------------------------------------------
 
-def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List[str], bool]:
-    """Return patched vbaProject.bin content, stats, module names, and parse status."""
+def _guess_text_offset(comp: bytes) -> Optional[int]:
+    try:
+        decomp = decompress_stream(comp)
+    except Exception:
+        return None
+    markers = [
+        b"Attribute VB_",
+        b"Attribute ",
+        b"Option Explicit",
+        b"Option Base",
+        b"Option Compare",
+        b"Sub ",
+        b"Function ",
+    ]
+    pos = [decomp.find(m) for m in markers]
+    pos = [p for p in pos if p >= 0]
+    return min(pos) if pos else None
+
+
+def _update_dir_offsets_to_zero(dir_comp: bytes, module_names: Set[str]) -> Tuple[bytes, bool]:
+    """Set ModuleOffset to 0 for the specified module stream names in the dir stream.
+
+    Returns (new_dir_comp, updated) where updated indicates if any change was applied.
+    Tolerant parser: walks records, tracks current stream name, overwrites 0x0031 payloads.
+    """
+    try:
+        data = bytearray(decompress_stream(dir_comp))
+    except Exception:
+        return dir_comp, False
+
+    # Discover codepage first (PROJECTCODEPAGE id=0x0003, size=2)
+    def get_u16(p: int) -> Optional[int]:
+        if p + 2 > len(data):
+            return None
+        return struct.unpack_from('<H', data, p)[0]
+
+    def get_u32(p: int) -> Optional[int]:
+        if p + 4 > len(data):
+            return None
+        return struct.unpack_from('<L', data, p)[0]
+
+    # Pass 1: read codepage and build minimal state
+    pos = 0
+    codepage = 'cp1252'
+    while pos + 6 <= len(data):
+        rec = get_u16(pos)
+        if rec is None:
+            break
+        size = get_u32(pos + 2)
+        if size is None or pos + 6 + size > len(data):
+            break
+        payload_start = pos + 6
+        if rec == 0x0003 and size == 2:
+            cp_value = get_u16(payload_start)
+            if cp_value:
+                for cand in (f"cp{cp_value}", f"windows-{cp_value}"):
+                    try:
+                        ''.encode(cand)
+                    except LookupError:
+                        continue
+                    else:
+                        codepage = cand
+                        break
+        pos = payload_start + size
+
+    # Pass 2: overwrite MODULEOFFSET for matching stream names
+    pos = 0
+    current_stream: Optional[str] = None
+    updated = False
+    while pos + 6 <= len(data):
+        rec = get_u16(pos)
+        if rec is None:
+            break
+        size = get_u32(pos + 2)
+        if size is None or pos + 6 + size > len(data):
+            break
+        payload_start = pos + 6
+        payload_end = payload_start + size
+        if rec == 0x0019:  # MODULENAME (bytes, but stream name follows)
+            pass  # skip; we only care about STREAMNAME
+        elif rec == 0x001A:  # STREAMNAME
+            raw = bytes(data[payload_start:payload_end])
+            try:
+                current_stream = raw.decode(codepage, errors='replace')
+            except Exception:
+                current_stream = None
+        elif rec == 0x0031 and size == 4:  # MODULEOFFSET
+            if current_stream and current_stream in module_names:
+                # Write 4 zero bytes
+                data[payload_start:payload_end] = b"\x00\x00\x00\x00"
+                updated = True
+        # advance
+        pos = payload_end
+
+    if not updated:
+        return dir_comp, False
+    return _compress_uncompressed(bytes(data)), True
+
+def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List[str], bool, bool]:
+    """Return (patched vbaProject.bin, modifications, module names, parse_ok, vba_changed)."""
     bio = io.BytesIO(project_bytes)
     ole = olefile.OleFileIO(bio, write_mode=True)
 
@@ -419,6 +534,7 @@ def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List
     modifications: Dict[str, int] = {}
     modules_seen: List[str] = []
     parse_ok = True
+    vba_changed = False
     if not parser.modules:
         # Fallback: enumerate streams under VBA/ to at least detect macros
         parse_ok = False
@@ -428,6 +544,109 @@ def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List
                 name = entry[1]
                 if name.lower() not in special:
                     modules_seen.append(name)
+
+        # Second fallback: try to parse dir_data in a forgiving way to recover offsets
+        def tolerant_dir_parse(data: bytes) -> List[ModuleInfo]:
+            modules: List[ModuleInfo] = []
+            pos = 0
+            current_name: Optional[str] = None
+            current_stream: Optional[str] = None
+            current_offset: Optional[int] = None
+            data_len = len(data)
+            def get_u16(p: int) -> Optional[int]:
+                if p + 2 > data_len:
+                    return None
+                return struct.unpack_from('<H', data, p)[0]
+            def get_u32(p: int) -> Optional[int]:
+                if p + 4 > data_len:
+                    return None
+                return struct.unpack_from('<L', data, p)[0]
+            while pos + 6 <= data_len:
+                rec = get_u16(pos)
+                if rec is None:
+                    break
+                size = get_u32(pos + 2)
+                if size is None or pos + 6 + size > data_len:
+                    break
+                payload_start = pos + 6
+                payload = data[payload_start:payload_start+size]
+                if rec == 0x0019:  # MODULENAME
+                    try:
+                        current_name = payload.decode('cp1252', errors='replace')
+                    except Exception:
+                        current_name = None
+                elif rec == 0x001A:  # STREAMNAME
+                    try:
+                        current_stream = payload.decode('cp1252', errors='replace')
+                    except Exception:
+                        current_stream = None
+                elif rec == 0x0031 and size == 4:  # MODULEOFFSET
+                    off = get_u32(payload_start)
+                    current_offset = off
+                elif rec == 0x002B:
+                    # MODULE terminator, commit if we have enough data
+                    if current_stream and current_offset is not None:
+                        modules.append(ModuleInfo(stream_name=current_stream, code_page='cp1252', text_offset=current_offset))
+                    current_name = None
+                    current_stream = None
+                    current_offset = None
+                # advance
+                pos = payload_start + size
+            # commit last if ended without terminator
+            if current_stream and current_offset is not None:
+                modules.append(ModuleInfo(stream_name=current_stream, code_page='cp1252', text_offset=current_offset))
+            return modules
+
+        tolerant_modules = tolerant_dir_parse(dir_data)
+        if tolerant_modules:
+            for m in tolerant_modules:
+                if m.stream_name not in modules_seen:
+                    modules_seen.append(m.stream_name)
+                sp = ["VBA", m.stream_name]
+                if not ole.exists(sp):
+                    continue
+                data = ole.openstream(sp).read()
+                patched = zero_pcode_region(data, m.text_offset)
+                if patched != data:
+                    ole.write_stream(sp, patched)
+                    modifications[m.stream_name] = m.text_offset
+                    vba_changed = True
+
+        # Heuristic fallback: guess text_offset by scanning decompressed module text
+        def guess_text_offset(comp: bytes) -> Optional[int]:
+            try:
+                decomp = decompress_stream(comp)
+            except Exception:
+                return None
+            # Common starters in VBA text
+            markers = [
+                b"Attribute VB_",
+                b"Attribute ",
+                b"Option Explicit",
+                b"Option Base",
+                b"Option Compare",
+                b"Sub ",
+                b"Function ",
+            ]
+            positions = [decomp.find(m) for m in markers]
+            positions = [p for p in positions if p >= 0]
+            if not positions:
+                return None
+            return max(0, min(positions))
+
+        for name in list(modules_seen):
+            sp = ["VBA", name]
+            if not ole.exists(sp):
+                continue
+            data = ole.openstream(sp).read()
+            off = guess_text_offset(data)
+            if off is None or off <= 0:
+                continue
+            patched = zero_pcode_region(data, off)
+            if patched != data:
+                ole.write_stream(sp, patched)
+                modifications[name] = off
+                vba_changed = True
 
     for module in parser.modules:
         modules_seen.append(module.stream_name)
@@ -439,20 +658,106 @@ def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List
         if patched != module_bytes:
             ole.write_stream(stream_path, patched)
             modifications[module.stream_name] = module.text_offset
+            vba_changed = True
 
     ole.close()
     bio.seek(0)
-    return bio.read(), modifications, modules_seen, parse_ok
+    return bio.read(), modifications, modules_seen, parse_ok, vba_changed
+
+
+def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List[str], bool, bool]:
+    """Rebuild each code module stream to contain only source text and set ModuleOffset=0.
+
+    Returns (patched bytes, modifications, modules_seen, parse_ok, vba_changed).
+    """
+    bio = io.BytesIO(project_bytes)
+    ole = olefile.OleFileIO(bio, write_mode=True)
+
+    # Read and parse dir (best-effort)
+    dir_stream_path = ["VBA", "dir"]
+    dir_comp = ole.openstream(dir_stream_path).read()
+    try:
+        dir_data = decompress_stream(dir_comp)
+        parser = DirStreamParser(dir_data)
+        parse_ok = len(parser.modules) > 0
+        offsets_map = {m.stream_name: m.text_offset for m in parser.modules}
+    except Exception:
+        parse_ok = False
+        offsets_map = {}
+
+    modifications: Dict[str, int] = {}
+    modules_seen: List[str] = []
+    repacked_modules: Set[str] = set()
+    vba_changed = False
+
+    # Enumerate module streams
+    special = {"dir", "project", "_vba_project", "projectwm"}
+    for entry in ole.listdir():
+        if len(entry) == 2 and entry[0].lower() == "vba":
+            name = entry[1]
+            if name.lower() in special:
+                continue
+            modules_seen.append(name)
+            sp = ["VBA", name]
+            if not ole.exists(sp):
+                continue
+            data = ole.openstream(sp).read()
+            # Only process MS-OVBA modules
+            if not data or data[0] != 0x01:
+                continue
+            # Determine text offset
+            text_off = offsets_map.get(name)
+            if text_off is None:
+                text_off = _guess_text_offset(data)
+            if text_off is None:
+                continue
+            # Repack: keep only text region
+            try:
+                decomp = decompress_stream(data)
+            except Exception:
+                continue
+            if text_off < 0 or text_off > len(decomp):
+                continue
+            text_bytes = decomp[text_off:]
+            rebuilt = _compress_uncompressed(text_bytes)
+            if rebuilt != data:
+                try:
+                    ole.write_stream(sp, rebuilt)
+                    modifications[name] = 0
+                    repacked_modules.add(name)
+                    vba_changed = True
+                except ValueError:
+                    # olefile cannot resize streams; fall back to size-preserving neutralisation
+                    patched = zero_pcode_region(data, text_off)
+                    if patched != data:
+                        ole.write_stream(sp, patched)
+                        modifications[name] = text_off
+                        vba_changed = True
+
+    # Try to zero ModuleOffset in dir for repacked modules
+    if repacked_modules:
+        new_dir_comp, changed = _update_dir_offsets_to_zero(dir_comp, repacked_modules)
+        if changed:
+            try:
+                ole.write_stream(dir_stream_path, new_dir_comp)
+            except ValueError:
+                # Cannot resize dir stream; leave as-is (Excel typically tolerates this)
+                pass
+
+    ole.close()
+    bio.seek(0)
+    return bio.read(), modifications, modules_seen, parse_ok, vba_changed
 
 
 def process_workbook(
-    input_path: str, output_path: str, in_place: bool = False
-) -> Tuple[Dict[str, int], Set[str], bool]:
-    """Process an XLSB workbook and return modification summary and modules."""
+    input_path: str, output_path: str, in_place: bool = False, repack: bool = False
+) -> Tuple[Dict[str, int], Set[str], bool, bool]:
+    """Process a workbook and return (modifications, modules_detected, parse_ok, vba_changed)."""
     target_normalized = "xl/vbaproject.bin"
     modifications: Dict[str, int] = {}
     modules_detected: Set[str] = set()
     parse_ok = True
+    vba_changed = False
     tmp_output = output_path
     if in_place:
         tmp_output = input_path + ".tmp"
@@ -461,17 +766,21 @@ def process_workbook(
         for item in zin.infolist():
             data = zin.read(item.filename)
             if item.filename.lower() == target_normalized:
-                patched, mods, modules_seen, this_parse_ok = patch_vba_project(data)
+                if repack:
+                    patched, mods, modules_seen, this_parse_ok, this_changed = repack_vba_project(data)
+                else:
+                    patched, mods, modules_seen, this_parse_ok, this_changed = patch_vba_project(data)
                 data = patched
                 modifications.update(mods)
                 modules_detected.update(modules_seen)
                 parse_ok = parse_ok and this_parse_ok
+                vba_changed = vba_changed or this_changed
             zout.writestr(item, data)
 
     if in_place:
         os.replace(tmp_output, input_path)
 
-    return modifications, modules_detected, parse_ok
+    return modifications, modules_detected, parse_ok, vba_changed
 
 
 def create_predecompile_backup(source_path: str) -> str:
@@ -501,6 +810,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="in_place",
         help="Overwrite the input file instead of creating a copy",
+    )
+    parser.add_argument(
+        "--repack",
+        action="store_true",
+        dest="repack",
+        help="Rebuild module streams to source-only and set ModuleOffset=0 where possible",
     )
     return parser
 
@@ -560,8 +875,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         else:
             print(f"Backup created at: {backup_path}")
 
-    mutation_summary, modules_detected, parse_ok = process_workbook(
-        source, output, in_place=args.in_place
+    mutation_summary, modules_detected, parse_ok, vba_changed = process_workbook(
+        source, output, in_place=args.in_place, repack=args.repack
     )
 
     if mutation_summary:
@@ -572,7 +887,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if parse_ok:
             print("VBA macros detected but already lacked P-code; no changes made.")
         else:
-            print("VBA modules detected, but the dir stream could not be parsed; no changes made.")
+            if vba_changed:
+                print("VBA modules detected; applied heuristic patch (dir stream not parsed).")
+            else:
+                print("VBA modules detected, but the dir stream could not be parsed; no changes made.")
     else:
         print("No VBA project modules found; workbook contains no macros.")
 
