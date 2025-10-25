@@ -95,5 +95,95 @@ class TestProcessWorkbook(unittest.TestCase):
                 mock_rep.assert_called()
 
 
+class TestRepackFallbacks(unittest.TestCase):
+    def _build_streams(self):
+        # Build a dir stream with MODULENAME/STREAMNAME 'M' and MODULEOFFSET=10, then MODULE terminator
+        def rec(rid: int, payload: bytes) -> bytes:
+            return struct.pack("<H", rid) + struct.pack("<L", len(payload)) + payload
+        decomp_dir = (
+            rec(0x0019, b"M") +
+            rec(0x001A, b"M") +
+            rec(0x0031, struct.pack("<L", 10)) +
+            rec(0x002B, b"")
+        )
+        dir_comp = vba_clean._compress_uncompressed(decomp_dir)
+        # Build module M: 10 bytes of pretext + source text
+        mod_decomp = b"P" * 10 + b"Option Explicit\nSub X(): End Sub\n"
+        mod_comp = vba_clean._compress_uncompressed(mod_decomp)
+        return {(
+            ("VBA", "dir")): dir_comp,
+            ("VBA", "M"): mod_comp,
+        }
+
+    def test_repack_in_memory_resize_sets_offset_zero(self):
+        streams = self._build_streams()
+
+        class FakeStream:
+            def __init__(self, data: bytes):
+                self._data = data
+            def read(self):
+                return self._data
+
+        class FakeOle:
+            def __init__(self, _src, write_mode=False):
+                # shallow copy per instance
+                self.streams = dict(streams)
+            def openstream(self, pathlist):
+                return FakeStream(self.streams[tuple(pathlist)])
+            def write_stream(self, pathlist, payload: bytes):
+                # allow resized writes to simulate success path
+                self.streams[tuple(pathlist)] = payload
+            def listdir(self):
+                return [list(k) for k in self.streams.keys()]
+            def exists(self, pathlist):
+                return tuple(pathlist) in self.streams
+            def close(self):
+                pass
+
+        with patch.object(vba_clean, "olefile") as mock_olemod:
+            mock_olemod.OleFileIO = FakeOle
+            new_bytes, mods, modules, parse_ok, changed = vba_clean.repack_vba_project(b"ignored")
+            self.assertTrue(changed)
+            self.assertEqual(mods.get("M"), 0, "Expected offset 0 when in-memory resize succeeds")
+            self.assertTrue(parse_ok)
+
+    def test_repack_falls_back_to_neutralization_when_resize_fails(self):
+        streams = self._build_streams()
+
+        class FakeStream:
+            def __init__(self, data: bytes):
+                self._data = data
+            def read(self):
+                return self._data
+
+        class FakeOle:
+            def __init__(self, _src, write_mode=False):
+                # shallow copy per instance
+                self.streams = dict(streams)
+            def openstream(self, pathlist):
+                return FakeStream(self.streams[tuple(pathlist)])
+            def write_stream(self, pathlist, payload: bytes):
+                # refuse resized writes to force fallback; allow equal size
+                key = tuple(pathlist)
+                if len(payload) != len(self.streams[key]):
+                    raise ValueError("resized write not allowed")
+                self.streams[key] = payload
+            def listdir(self):
+                return [list(k) for k in self.streams.keys()]
+            def exists(self, pathlist):
+                return tuple(pathlist) in self.streams
+            def close(self):
+                pass
+
+        # Ensure pythoncom path is not available
+        with patch.dict("sys.modules", {"pythoncom": None}):
+            with patch.object(vba_clean, "olefile") as mock_olemod:
+                mock_olemod.OleFileIO = FakeOle
+                new_bytes, mods, modules, parse_ok, changed = vba_clean.repack_vba_project(b"ignored")
+                self.assertTrue(changed)
+                self.assertEqual(mods.get("M"), 10, "Expected neutralization offset when resize is refused")
+                self.assertTrue(parse_ok)
+
+
 if __name__ == "__main__":
     unittest.main()

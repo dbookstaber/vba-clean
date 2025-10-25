@@ -33,54 +33,48 @@ A benefit of this approach (in contrast to [other VBA cleaners or decompilers](h
 ## Requirements
 
 - Python 3.8+
-- `olefile` package
+- `olefile` package.  (Install via `pip install olefile`)
 
-Install the dependency:
-
-```
-python -m pip install olefile
-```
 
 ## Usage
 
-Show help:
+Show help: `python vba_clean.py --help`
 
-```powershell
-python vba_clean.py --help
-```
+`python vba_clean.py path\to\Workbook.xlsb` creates `path\to\Workbook_clean.xlsb` with P-code removed.
 
-Create a new file with P-code removed:
-
-```powershell
-python vba_clean.py path\to\Workbook.xlsb
-# or for .xlsm
-python vba_clean.py path\to\Workbook.xlsm
-```
-
-Modify in place (a backup copy is created first):
-
-```powershell
-python vba_clean.py --in-place path\to\Workbook.xlsb
-# Creates a sibling backup: "Predecompiled Workbook.xlsb"
-```
+Clean in place: `python vba_clean.py --in-place path\to\Workbook.xlsb` will first create a backup `path\to\Precompiled Workbook.xlsb`.
 
 Output messaging:
 
 - "P-code removed from modules" — modules were detected and updated
 - "VBA macros detected but already lacked P-code" — modules present, but nothing to change
 - "No VBA project modules found" — no macros were present
+- "VBA modules detected; applied heuristic patch (dir stream not parsed)." — modules were present and updated even though the `dir` stream couldn’t be parsed strictly; see [TECH_NOTE](TECH_NOTE.md#heuristic-patch-whywhenhow).
+
+### Repack mode (Windows)
+
+For a deeper clean: The `--repack` flag rebuilds module streams as source‑only and, when supported by the environment, updates the `VBA/dir` stream so `ModuleOffset=0` for those modules. On Windows, the tool uses Structured Storage APIs to fully rebuild `vbaProject.bin` when in‑memory resized writes are not possible; otherwise it falls back to the safe size‑preserving neutralization.
+
+Example: `python vba_clean.py --repack path\to\Workbook.xlsb -o path\to\Workbook_clean.xlsb`
+
+When repack succeeds for a module, the CLI will report `offset 0`.
+
 
 ## Testing
 
-This repo includes `unittest`-based tests focused on CLI behavior and safety.
-
-Run tests:
+This repo includes `unittest`-based tests.  To run:
 
 ```powershell
-python -m unittest tests.test_cli
-# or
 python -m unittest discover
+
+# Run just the test_cli tests:
+python -m unittest tests.test_cli
 ```
+
+### Parity harness
+
+For module‑text parity checks between two workbooks (e.g., against a decompiler output), see [TECH_NOTE.md](TECH_NOTE.md#parity-validation-harness-usage) for the `tests/parity_harness.py` usage.
+
 
 ## Notes on safety and limitations
 
@@ -90,4 +84,4 @@ python -m unittest discover
 
 ## Internals and references
 
-- MS-OVBA compression and the `dir` stream format are implemented per [MS-OVBA specification](https://learn.microsoft.com/openspecs/office_file_formats/ms-ovba/).
+- MS-OVBA compression and the `dir` stream format are implemented per [MS-OVBA specification](https://learn.microsoft.com/openspecs/office_file_formats/ms-ovba/). See TECH_NOTE.md for notes on real‑world tolerances.

@@ -27,7 +27,7 @@ import struct
 import sys
 import zipfile
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     import olefile
@@ -763,6 +763,82 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
             bio.seek(0)
             return bio.read(), modifications, modules_seen, parse_ok, vba_changed
         else:
+            # Try Windows Structured Storage rebuild (IStorage/IStream) if available
+            def _try_win32_rebuild() -> Optional[bytes]:
+                try:
+                    import pythoncom  # type: ignore
+                except Exception:
+                    return None
+                # Collect all stream bytes
+                stream_map: Dict[Tuple[str, ...], bytes] = {}
+                for entry in ole.listdir():
+                    try:
+                        data = ole.openstream(entry).read()
+                        stream_map[tuple(entry)] = data
+                    except Exception:
+                        # likely a storage, not a stream
+                        continue
+                # Apply replacements
+                for sp_tuple, payload in planned_writes.items():
+                    stream_map[sp_tuple] = payload
+                if dir_replacement is not None:
+                    stream_map[tuple(dir_stream_path)] = dir_replacement
+
+                import tempfile, os as _os
+                tmp_path = None
+                try:
+                    tmp = tempfile.NamedTemporaryFile(delete=False)
+                    tmp_path = tmp.name
+                    tmp.close()
+                    # STGM flags
+                    STGM_CREATE = 0x00001000
+                    STGM_READWRITE = 0x00000002
+                    STGM_SHARE_EXCLUSIVE = 0x00000010
+                    root = pythoncom.StgCreateDocfile(tmp_path, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0)
+                    # storage cache
+                    storages: Dict[Tuple[str, ...], Any] = {(): root}
+                    def ensure_storage(path: Tuple[str, ...]):
+                        if path in storages:
+                            return storages[path]
+                        parent = ensure_storage(path[:-1]) if path[:-1] else storages[()]
+                        sub = parent.CreateStorage(path[-1], STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, 0)
+                        storages[path] = sub
+                        return sub
+                    # Write streams
+                    for sp, data in stream_map.items():
+                        if len(sp) == 1:
+                            parent = storages[()]
+                            name = sp[0]
+                        else:
+                            parent = ensure_storage(sp[:-1])
+                            name = sp[-1]
+                        stm = parent.CreateStream(name, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, 0)
+                        mv = memoryview(data)
+                        pos = 0
+                        chunk = 1 << 20
+                        while pos < len(mv):
+                            stm.Write(mv[pos:pos+chunk])
+                            pos += chunk
+                        stm.Commit(0)
+                    root.Commit(0)
+                    with open(tmp_path, 'rb') as fh:
+                        return fh.read()
+                except Exception:
+                    return None
+                finally:
+                    if tmp_path and _os.path.exists(tmp_path):
+                        try:
+                            _os.remove(tmp_path)
+                        except Exception:
+                            pass
+
+            rebuilt_bytes = _try_win32_rebuild()
+            if rebuilt_bytes is not None:
+                for (_, name), _payload in planned_writes.items():
+                    modifications[name] = 0
+                vba_changed = True
+                return rebuilt_bytes, modifications, modules_seen, parse_ok, vba_changed
+
             # Fallback: recreate using a temp file on disk
             ole.close()
             import tempfile
