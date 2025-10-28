@@ -451,6 +451,16 @@ def _guess_text_offset(comp: bytes) -> Optional[int]:
     return min(positions) if positions else None
 
 
+def _looks_like_vba_text(blob: bytes) -> bool:
+    head = blob[:512]
+    # must contain some ASCII letters and typical tokens; very few NULs
+    markers_ascii = (b"Attribute VB_", b"Option ", b"Sub ", b"Function ", b"VERSION ")
+    markers_u16 = tuple(b"".join(bytes((c,0)) for c in m) for m in markers_ascii)
+    has_token = any(t in head for t in markers_ascii + markers_u16)
+    nul_ratio = head.count(0) / max(1, len(head))
+    return has_token and nul_ratio < 0.6
+
+
 def _update_dir_offsets_to_zero(dir_comp: bytes, module_names: Set[str]) -> Tuple[bytes, bool]:
     """Set ModuleOffset (0x0031 payload) to 0 for given module streams by robust search.
 
@@ -848,13 +858,6 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
     # size-preserving neutralization of all modules based on recovered offsets,
     # without altering dir offsets or dropping SRP/_VBA_PROJECT.
     if not parse_ok:
-        def _looks_like_vba_text(blob: bytes) -> bool:
-            head = blob[:512]
-            # must contain some ASCII letters and typical tokens; very few NULs
-            has_token = any(t in head for t in (b"Attribute VB_", b"Option ", b"Sub ", b"Function ", b"VERSION "))
-            nul_ratio = head.count(0) / max(1, len(head))
-            return has_token and nul_ratio < 0.6
-
         neutral_writes: Dict[Tuple[str, str], bytes] = {}
         repack_writes: Dict[Tuple[str, str], bytes] = {}
         repack_names: Set[str] = set()

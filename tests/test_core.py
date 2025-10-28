@@ -39,6 +39,23 @@ class TestTolerantDecompression(unittest.TestCase):
         self.assertEqual(decomp[:10], b"\x00" * 10)
         self.assertEqual(decomp[10:], data[10:])
 
+    def test_looks_like_vba_text(self):
+        # Test the heuristic for detecting VBA text regions
+        good = b"Attribute VB_Name = \"Module1\"\r\nSub Test()\r\nEnd Sub"
+        self.assertTrue(vba_clean._looks_like_vba_text(good))
+
+        # No markers
+        bad = b"\x00\x01\x02\x03" * 100
+        self.assertFalse(vba_clean._looks_like_vba_text(bad))
+
+        # Markers but too many NULs (>0.6 ratio)
+        bad2 = b"Attribute VB_" + b"\x00" * 400
+        self.assertFalse(vba_clean._looks_like_vba_text(bad2))
+
+        # UTF-16 markers
+        good_utf16 = b"A\x00t\x00t\x00r\x00i\x00b\x00u\x00t\x00e\x00 \x00V\x00B\x00_\x00"
+        self.assertTrue(vba_clean._looks_like_vba_text(good_utf16))
+
 
 class TestDirUpdate(unittest.TestCase):
     def test_update_dir_offsets_to_zero(self):
