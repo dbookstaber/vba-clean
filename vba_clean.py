@@ -895,22 +895,6 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                         break
                 if pos_marker is not None:
                     candidates = [(lbl, min(off, pos_marker)) for (lbl, off) in candidates]
-                # If we're forcing repack-all, scan for the text start and repack
-                if FORCE_REPACK_ALL and decomp0:
-                    # Find the text start by scanning for the first region that looks like VBA text
-                    off_use = 0
-                    for i in range(0, max(0, len(decomp0) - 512), 10):
-                        if _looks_like_vba_text(decomp0[i:i+512]):
-                            off_use = i
-                            break
-                    text_bytes = decomp0[off_use:]
-                    if _looks_like_vba_text(text_bytes[:512]):
-                        rebuilt = _compress_uncompressed(text_bytes)
-                        repack_writes[tuple(sp)] = rebuilt
-                        repack_names.add(name)
-                        modifications[name] = 0
-                        vba_changed = True
-                        continue
                 # Validated neutralization path
                 chosen = None
                 for label, off in candidates:
@@ -938,18 +922,8 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                         neutral_writes[tuple(sp)] = patched
                         modifications[name] = off
                         vba_changed = True
-                else:
-                    # Could not validate; if we have a marker, repack at marker, else leave unchanged to avoid corruption
-                    if pos_marker is not None:
-                        pos_use = pos_marker
-                        text_bytes = decomp0[pos_use:]
-                        rebuilt = _compress_uncompressed(text_bytes)
-                        repack_writes[tuple(sp)] = rebuilt
-                        repack_names.add(name)
-                        modifications[name] = 0
-                        vba_changed = True
         # If any module changed, attempt a rebuild that omits caches (__SRP_* and _VBA_PROJECT)
-        if vba_changed:
+        if vba_changed and repack_names:
             def _rebuild_without_caches_return_bytes() -> Optional[bytes]:
                 # Prefer pythoncom Structured Storage to create a fresh doc and omit caches
                 try:
@@ -965,6 +939,8 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                         data = ole.openstream(ent).read()
                         if len(ent) == 2 and ent[0].lower() == 'vba':
                             nm = ent[1]
+                            if nm.lower().startswith('__srp_'):
+                                continue
                             if nm == '_VBA_PROJECT' and not keep_vba_project:
                                 continue
                         stream_map[tuple(ent)] = data
