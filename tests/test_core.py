@@ -65,6 +65,36 @@ class TestDirUpdate(unittest.TestCase):
         off = struct.unpack_from("<L", new_decomp, p)[0]
         self.assertEqual(off, 0)
 
+    def test_update_dir_offsets_robust_search_when_order_varies(self):
+        # Construct a dir stream where MODULEOFFSET (0x0031) appears before STREAMNAME (0x001A)
+        def rec(rec_id: int, payload: bytes) -> bytes:
+            return struct.pack("<H", rec_id) + struct.pack("<L", len(payload)) + payload
+        stream_name = b"WeirdOrder"
+        module_offset_payload = struct.pack("<L", 4096)
+        # Order: MODULENAME, MODULEOFFSET, STREAMNAME, TERMINATOR
+        decomp_dir = (
+            rec(0x0019, stream_name) +
+            rec(0x0031, module_offset_payload) +
+            rec(0x001A, stream_name) +
+            rec(0x002B, b"")
+        )
+        comp_dir = vba_clean._compress_uncompressed(decomp_dir)
+        new_comp, changed = vba_clean._update_dir_offsets_to_zero(comp_dir, {"WeirdOrder"})
+        self.assertTrue(changed)
+        new_decomp = vba_clean.decompress_stream(new_comp)
+        # Verify that the first 0x0031 encountered after the STREAMNAME has payload zeroed
+        p = new_decomp.find(stream_name)
+        self.assertGreaterEqual(p, 0)
+        # Search forward for 0x0031
+        while p + 6 <= len(new_decomp):
+            rid = struct.unpack_from("<H", new_decomp, p)[0]
+            size = struct.unpack_from("<L", new_decomp, p + 2)[0]
+            if rid == 0x0031 and size == 4:
+                off = struct.unpack_from("<L", new_decomp, p + 6)[0]
+                self.assertEqual(off, 0)
+                break
+            p += 2
+
 
 class TestProcessWorkbook(unittest.TestCase):
     def test_cli_repack_flag_parsing(self):
@@ -183,6 +213,43 @@ class TestRepackFallbacks(unittest.TestCase):
                 self.assertTrue(changed)
                 self.assertEqual(mods.get("M"), 10, "Expected neutralization offset when resize is refused")
                 self.assertTrue(parse_ok)
+
+    def test_repack_parse_fail_neutralizes_modules(self):
+        """When strict dir parse fails, repack should still neutralize modules using recovered offsets."""
+        streams = self._build_streams()
+
+        class FakeStream:
+            def __init__(self, data: bytes):
+                self._data = data
+            def read(self):
+                return self._data
+
+        class FakeOle:
+            def __init__(self, _src, write_mode=False):
+                self.streams = dict(streams)
+            def openstream(self, pathlist):
+                return FakeStream(self.streams[tuple(pathlist)])
+            def write_stream(self, pathlist, payload: bytes):
+                # size-preserving writes are allowed in this fake
+                self.streams[tuple(pathlist)] = payload
+            def listdir(self):
+                return [list(k) for k in self.streams.keys()]
+            def exists(self, pathlist):
+                return tuple(pathlist) in self.streams
+            def close(self):
+                pass
+
+        # Force strict dir parsing to yield zero modules while allowing tolerant extraction
+        class EmptyDirParser:
+            def __init__(self, _bytes: bytes):
+                self.modules = []
+
+        with patch.object(vba_clean, "olefile") as mock_olemod, patch.object(vba_clean, "DirStreamParser", EmptyDirParser):
+            mock_olemod.OleFileIO = FakeOle
+            new_bytes, mods, modules, parse_ok, changed = vba_clean.repack_vba_project(b"ignored")
+            self.assertFalse(parse_ok)
+            self.assertTrue(changed)
+            self.assertIn("M", mods)
 
 
 if __name__ == "__main__":
