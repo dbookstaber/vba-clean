@@ -29,15 +29,36 @@ class TestTolerantDecompression(unittest.TestCase):
         out = vba_clean.decompress_stream(cont)
         self.assertEqual(out, data)
 
-    def test_zero_pcode_region_on_short_uncompressed(self):
-        data = (b"A" * 8) + (b"B" * 8)
-        cont = _mk_uncompressed_container(data, signature_bits=0)
-        # Zero first 10 bytes of decompressed content
-        patched = vba_clean.zero_pcode_region(cont, 10)
-        self.assertNotEqual(patched, cont)
-        decomp = vba_clean.decompress_stream(patched)
-        self.assertEqual(decomp[:10], b"\x00" * 10)
-        self.assertEqual(decomp[10:], data[10:])
+    def test_zero_pcode_region_zeros_raw_bytes(self):
+        """zero_pcode_region should zero the first text_offset raw bytes (PerformanceCache),
+        leaving the CompressedContainer intact."""
+        # Build a module stream: 10 bytes of P-code + compressed container
+        pcode = b"P" * 10
+        source_text = b"Attribute VB_Name = \"Test\"\r\nSub X(): End Sub\r\n"
+        compressed = vba_clean._compress_uncompressed(source_text)
+        module_stream = pcode + compressed
+        
+        # Zero first 10 bytes (the P-code)
+        patched = vba_clean.zero_pcode_region(module_stream, 10)
+        
+        # First 10 bytes should be zeroed
+        self.assertEqual(patched[:10], b"\x00" * 10)
+        # Compressed container should be unchanged
+        self.assertEqual(patched[10:], compressed)
+        # Should still decompress correctly
+        decomp = vba_clean.decompress_stream(patched[10:])
+        self.assertEqual(decomp, source_text)
+
+    def test_decompress_module_text(self):
+        """decompress_module_text should skip PerformanceCache and decompress source."""
+        pcode = b"P" * 100
+        source_text = b"Option Explicit\r\nSub Test(): End Sub\r\n"
+        compressed = vba_clean._compress_uncompressed(source_text)
+        module_stream = pcode + compressed
+        
+        # Decompress using the helper function
+        decomp = vba_clean.decompress_module_text(module_stream, 100)
+        self.assertEqual(decomp, source_text)
 
     def test_looks_like_vba_text(self):
         # Test the heuristic for detecting VBA text regions
@@ -154,12 +175,14 @@ class TestRepackFallbacks(unittest.TestCase):
             rec(0x002B, b"")
         )
         dir_comp = vba_clean._compress_uncompressed(decomp_dir)
-        # Build module M: 10 bytes of pretext + source text
-        mod_decomp = b"P" * 10 + b"Option Explicit\nSub X(): End Sub\n"
-        mod_comp = vba_clean._compress_uncompressed(mod_decomp)
-        return {(
-            ("VBA", "dir")): dir_comp,
-            ("VBA", "M"): mod_comp,
+        # Build module M: 10 bytes of PerformanceCache + CompressedContainer with source text
+        # Per MS-OVBA: module stream = PerformanceCache (raw bytes) + CompressedContainer
+        source_text = b"Option Explicit\nSub X(): End Sub\n"
+        compressed_source = vba_clean._compress_uncompressed(source_text)
+        mod_stream = b"P" * 10 + compressed_source  # 10 bytes P-code + compressed source
+        return {
+            ("VBA", "dir"): dir_comp,
+            ("VBA", "M"): mod_stream,
         }
 
     def test_repack_in_memory_resize_sets_offset_zero(self):

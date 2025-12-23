@@ -56,8 +56,14 @@ def _copytoken_help(decompressed_current: int, decompressed_chunk_start: int) ->
     return length_mask, offset_mask, bit_count, maximum_length
 
 
-def decompress_stream(compressed_container: bytes) -> bytes:
-    """Decompress a VBA stream according to MS-OVBA section 2.4.1."""
+def decompress_stream(compressed_container: bytes, strict: bool = False) -> bytes:
+    """Decompress a VBA stream according to MS-OVBA section 2.4.1.
+
+    If ``strict`` is True, enforce MS-OVBA checks strictly (raise on
+    invalid CompressedChunkSignature or unexpected uncompressed chunk sizes),
+    matching the behavior used by reference implementations such as
+    oletools. By default the function is tolerant to minor deviations.
+    """
     if not isinstance(compressed_container, bytearray):
         compressed = bytearray(compressed_container)
     else:
@@ -83,22 +89,40 @@ def decompress_stream(compressed_container: bytes) -> bytes:
         chunk_size = (compressed_chunk_header & 0x0FFF) + 3
         chunk_signature = (compressed_chunk_header >> 12) & 0x07
         chunk_flag = (compressed_chunk_header >> 15) & 0x01
-        # Tolerate non-spec signatures/sizes seen in the wild; bounds-check only
+        # Strict mode: enforce signature and uncompressed-chunk size per MS-OVBA
+        if strict:
+            if chunk_signature != 0b011:
+                raise ValueError(f"Invalid CompressedChunkSignature 0b{chunk_signature:03b}")
+            if chunk_flag == 0 and chunk_size != 4098:
+                raise ValueError(f"Uncompressed chunk size unexpected ({chunk_size}); expected 4098 in strict mode")
+        # Non-strict: be tolerant of non-spec signatures/sizes seen in the wild;
+        # only bounds-check compressed chunk sizes.
         if chunk_flag == 1 and chunk_size > 4098:
             raise ValueError("Compressed chunk size exceeds 4098 bytes")
 
-        compressed_end = min(len(compressed), compressed_chunk_start + chunk_size)
         compressed_current = compressed_chunk_start + 2
 
         if chunk_flag == 0:
-            # Some files use shorter final uncompressed chunks; copy what's available (<=4096)
-            literal_len = min(4096, max(0, compressed_end - compressed_current))
-            if literal_len:
+            # Per MS-OVBA clarification: for intermediate raw (uncompressed) chunks,
+            # ignore the Size field and assume 4096 data bytes. Only for the final
+            # chunk (when fewer than 4096 bytes remain) use the actual remaining count.
+            # This matches the legacy VBA code behavior described by Microsoft.
+            bytes_remaining = len(compressed) - compressed_current
+            if bytes_remaining >= 4096:
+                # Intermediate raw chunk: always 4096 bytes regardless of header
+                literal_len = 4096
+            else:
+                # Final raw chunk: use what's available
+                literal_len = bytes_remaining
+            if literal_len > 0:
                 decompressed.extend(
                     compressed[compressed_current : compressed_current + literal_len]
                 )
                 compressed_current += literal_len
             continue
+
+        # For compressed chunks, use the header size to determine chunk end
+        compressed_end = min(len(compressed), compressed_chunk_start + chunk_size)
 
         decompressed_chunk_start = len(decompressed)
         while compressed_current < compressed_end:
@@ -353,84 +377,69 @@ class DirStreamParser:
 # P-code neutralisation
 # ---------------------------------------------------------------------------
 
-def zero_pcode_region(compressed: bytes, text_offset: int) -> bytes:
-    """Return a new compressed stream with the first ``text_offset`` bytes zeroed.
+def zero_pcode_region(module_stream: bytes, text_offset: int) -> bytes:
+    """Return a new module stream with the PerformanceCache region zeroed.
 
-    We walk the compressed container, mirroring the decompression algorithm, and
-    replace literal token bytes that contribute to the initial ``text_offset``
-    decompressed region with zero. Copy tokens refer only to already processed
-    bytes, so they automatically resolve to zero after literals are cleared.
+    Per MS-OVBA, a module stream consists of:
+      - PerformanceCache: raw binary P-code of size `text_offset` (aka ModuleOffset)
+      - CompressedContainer: MS-OVBA compressed source text starting at byte `text_offset`
+    
+    This function zeros the PerformanceCache region (the first `text_offset` bytes)
+    while preserving the CompressedContainer. This effectively removes the P-code
+    while keeping the source text intact. Excel will regenerate P-code on next compile.
     """
     if text_offset <= 0:
-        return compressed
+        return module_stream
 
-    buf = bytearray(compressed)
-    compressed_current = 0
-    decompressed_current = 0
+    if not module_stream:
+        return module_stream
 
-    if not buf:
-        return bytes(buf)
-    if buf[compressed_current] != 0x01:
-        raise ValueError("Invalid compressed stream signature")
-    compressed_current += 1
-
-    while compressed_current < len(buf) and decompressed_current < text_offset:
-        chunk_start = compressed_current
-        header = struct.unpack_from("<H", buf, chunk_start)[0]
-        chunk_size = (header & 0x0FFF) + 3
-        chunk_flag = (header >> 15) & 0x01
-
-        compressed_current = chunk_start + 2
-        compressed_end = min(len(buf), chunk_start + chunk_size)
-
-        if chunk_flag == 0:
-            # Copy length may be shorter than 4096 in some files
-            data_len = min(4096, max(0, compressed_end - compressed_current))
-            remaining = min(data_len, max(0, text_offset - decompressed_current))
-            if remaining > 0:
-                start = compressed_current
-                end = start + remaining
-                buf[start:end] = b"\x00" * remaining
-            decompressed_current += data_len
-            compressed_current += data_len
-            continue
-
-        chunk_decompressed_start = decompressed_current
-        while compressed_current < compressed_end and decompressed_current < text_offset:
-            flag_byte = buf[compressed_current]
-            compressed_current += 1
-            for bit_index in range(8):
-                if compressed_current >= compressed_end:
-                    break
-                flag_bit = (flag_byte >> bit_index) & 1
-                if flag_bit == 0:
-                    if decompressed_current < text_offset:
-                        buf[compressed_current] = 0
-                    compressed_current += 1
-                    decompressed_current += 1
-                else:
-                    copy_token = struct.unpack_from("<H", buf, compressed_current)[0]
-                    length_mask, offset_mask, bit_count, _ = _copytoken_help(
-                        decompressed_current, chunk_decompressed_start
-                    )
-                    length = (copy_token & length_mask) + 3
-                    compressed_current += 2
-                    decompressed_current += length
-                    if decompressed_current >= text_offset:
-                        break
+    buf = bytearray(module_stream)
+    
+    # Simply zero the first text_offset bytes (the PerformanceCache region)
+    zero_len = min(text_offset, len(buf))
+    buf[0:zero_len] = b"\x00" * zero_len
 
     return bytes(buf)
+
+
+def decompress_module_text(module_stream: bytes, text_offset: int) -> bytes:
+    """Decompress the source text from a module stream.
+
+    Per MS-OVBA, the module stream structure is:
+      - PerformanceCache: raw binary P-code of size `text_offset` bytes
+      - CompressedContainer: MS-OVBA compressed source text starting at byte `text_offset`
+    
+    This function skips the PerformanceCache and decompresses the source text.
+    """
+    if text_offset < 0:
+        text_offset = 0
+    
+    if text_offset >= len(module_stream):
+        return b""
+    
+    # The compressed container starts at text_offset
+    compressed_container = module_stream[text_offset:]
+    return decompress_stream(compressed_container)
 
 
 # ---------------------------------------------------------------------------
 # Workbook processing
 # ---------------------------------------------------------------------------
 
-def _guess_text_offset(comp: bytes) -> Optional[int]:
-    try:
-        decomp = decompress_stream(comp)
-    except Exception:
+def _guess_text_offset(module_stream: bytes) -> Optional[int]:
+    """Heuristically find the ModuleOffset (start of compressed source text) in a module stream.
+    
+    Per MS-OVBA, the module stream is:
+      - PerformanceCache: raw binary P-code (variable length)
+      - CompressedContainer: starts with signature byte 0x01
+    
+    We scan for byte 0x01 followed by what looks like a valid compressed chunk,
+    then verify by attempting decompression and checking for VBA source markers.
+    """
+    if not module_stream or len(module_stream) < 10:
         return None
+    
     markers_ascii = [
         b"Attribute VB_",
         b"Attribute ",
@@ -441,14 +450,51 @@ def _guess_text_offset(comp: bytes) -> Optional[int]:
         b"Function ",
         b"VERSION ",
     ]
-    # Also search UTF-16LE encodings of the same markers
-    markers_u16 = [b"".join(bytes((c,0)) for c in m) for m in markers_ascii]
-    positions = []
-    for m in markers_ascii + markers_u16:
-        p = decomp.find(m)
-        if p >= 0:
-            positions.append(p)
-    return min(positions) if positions else None
+    
+    # Scan for potential compression signature (0x01)
+    # Limit search to avoid very long scans
+    max_search = min(len(module_stream) - 10, 50000)
+    
+    for pos in range(max_search):
+        if module_stream[pos] != 0x01:
+            continue
+        
+        # Quick validation: next 2 bytes should be a valid chunk header
+        if pos + 3 >= len(module_stream):
+            continue
+        
+        # Read chunk header
+        header = struct.unpack_from("<H", module_stream, pos + 1)[0]
+        chunk_flag = (header >> 15) & 0x01
+        
+        # For raw chunks at start, the data should look like ASCII text
+        # For compressed chunks, we'll try decompression
+        if chunk_flag == 0:  # uncompressed
+            # Check if payload starts with ASCII text marker
+            payload_start = pos + 3
+            if payload_start + 20 > len(module_stream):
+                continue
+            sample = module_stream[payload_start:payload_start + 50]
+            if any(sample.startswith(m) for m in markers_ascii):
+                return pos
+            # Skip if doesn't look promising
+            continue
+        
+        # For compressed chunks, try decompression with timeout protection
+        try:
+            compressed_region = module_stream[pos:]
+            # Limit the region we decompress for performance
+            limited_region = compressed_region[:8192]  # First 8KB should be enough to find markers
+            decomp = decompress_stream(limited_region)
+            
+            # Check if decompressed text contains VBA markers near the start
+            head = decomp[:512]
+            if any(m in head for m in markers_ascii):
+                return pos
+        except Exception:
+            continue
+    
+    return None
 
 
 def _looks_like_vba_text(blob: bytes) -> bool:
@@ -510,15 +556,14 @@ def _update_dir_offsets_to_zero(dir_comp: bytes, module_names: Set[str]) -> Tupl
         pos += 6 + size
 
     updated = False
-    # Tolerant scan anchored at STREAMNAME (0x001A). If not found forward before MODULE end (0x002B),
+    # Tolerant byte-by-byte scan anchored at STREAMNAME (0x001A). If not found forward before MODULE end (0x002B),
     # attempt a bounded backward search.
     pos_scan = 0
     while pos_scan + 6 <= len(data):
         rec = get_u16(pos_scan)
         size = get_u32(pos_scan + 2)
-        if rec is None or size is None:
-            break
-        if rec == 0x001A and 0 < size <= 256 and pos_scan + 6 + size <= len(data):
+        # Check if this looks like a valid STREAMNAME record
+        if rec == 0x001A and size is not None and 0 < size <= 256 and pos_scan + 6 + size <= len(data):
             raw_name = bytes(data[pos_scan + 6 : pos_scan + 6 + size])
             try:
                 stream_name = raw_name.decode(codepage, errors='replace')
@@ -608,14 +653,13 @@ def _extract_offsets_from_dir(dir_comp: bytes) -> Dict[str, int]:
                         break
         pos += 6 + size
 
-    # Scan for stream names
+    # Scan for stream names - byte-by-byte search for STREAMNAME (0x001A) pattern
     pos = 0
     while pos + 6 <= n:
         rec = u16(pos)
         size = u32(pos + 2)
-        if rec is None or size is None or pos + 6 + size > n:
-            break
-        if rec == 0x001A:  # STREAMNAME
+        # Check if this looks like a valid STREAMNAME record
+        if rec == 0x001A and size is not None and 0 < size < 256 and pos + 6 + size <= n:
             raw = buf[pos + 6 : pos + 6 + size]
             try:
                 name = raw.decode(codepage, errors='replace')
@@ -758,34 +802,15 @@ def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List
                     modifications[m.stream_name] = m.text_offset
                     vba_changed = True
 
-        # Heuristic fallback: guess text_offset by scanning decompressed module text
-        def guess_text_offset(comp: bytes) -> Optional[int]:
-            try:
-                decomp = decompress_stream(comp)
-            except Exception:
-                return None
-            # Common starters in VBA text
-            markers = [
-                b"Attribute VB_",
-                b"Attribute ",
-                b"Option Explicit",
-                b"Option Base",
-                b"Option Compare",
-                b"Sub ",
-                b"Function ",
-            ]
-            positions = [decomp.find(m) for m in markers]
-            positions = [p for p in positions if p >= 0]
-            if not positions:
-                return None
-            return max(0, min(positions))
-
+        # Heuristic fallback: use _guess_text_offset for modules not yet processed
         for name in list(modules_seen):
+            if name in modifications:
+                continue  # Already processed
             sp = ["VBA", name]
             if not ole.exists(sp):
                 continue
             data = ole.openstream(sp).read()
-            off = guess_text_offset(data)
+            off = _guess_text_offset(data)
             if off is None or off <= 0:
                 continue
             patched = zero_pcode_region(data, off)
@@ -871,8 +896,9 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                     data = ole.openstream(sp).read()
                 except Exception:
                     continue
-                if not data or data[0] != 0x01:
+                if not data:
                     continue
+                modules_seen.append(name)
                 # Derive two candidates: from tolerant dir and from heuristic content scan
                 cand_dir = offsets_map.get(name)
                 cand_guess = _guess_text_offset(data)
@@ -885,42 +911,25 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                         candidates.append(("guess", cand_guess))
                 if not candidates and not FORCE_REPACK_ALL:
                     continue
-                # Safety: never zero past the earliest plausible text marker in this module
-                try:
-                    decomp0 = decompress_stream(data)
-                except Exception:
-                    decomp0 = b""
-                pos_marker = None
-                for m in (b"Attribute VB_", b"Option ", b"Sub ", b"Function ", b"VERSION "):
-                    p = decomp0.find(m)
-                    if p >= 0:
-                        pos_marker = p
-                        break
-                if pos_marker is not None:
-                    candidates = [(lbl, min(off, pos_marker)) for (lbl, off) in candidates]
-                # Validated neutralization path
+                # Safety: verify offset points to valid compressed container
                 chosen = None
                 for label, off in candidates:
+                    if off < 0 or off >= len(data):
+                        continue
+                    # Check that offset points to 0x01 signature
+                    if data[off] != 0x01:
+                        continue
                     try:
-                        patched_try = zero_pcode_region(data, off)
-                        decomp = decompress_stream(patched_try)
-                        # Find text start again and validate head
-                        pos = None
-                        for m in (b"Attribute VB_", b"Option ", b"Sub ", b"Function ", b"VERSION "):
-                            p = decomp.find(m)
-                            if p >= 0:
-                                pos = p
-                                break
-                        if pos is None or not decomp0:
-                            continue
-                        # Accept only if early text bytes remain identical to original text
-                        if decomp0[pos:pos+256] == decomp[pos:pos+256] and _looks_like_vba_text(decomp[pos:pos+512]):
-                            chosen = (off, patched_try, pos)
+                        # Verify we can decompress the source text
+                        decomp = decompress_module_text(data, off)
+                        if _looks_like_vba_text(decomp[:512]):
+                            chosen = (off, label)
                             break
                     except Exception:
                         continue
                 if chosen is not None:
-                    off, patched, _ = chosen
+                    off, label = chosen
+                    patched = zero_pcode_region(data, off)
                     if patched != data:
                         neutral_writes[tuple(sp)] = patched
                         modifications[name] = off
@@ -1022,23 +1031,22 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
             if not ole.exists(sp):
                 continue
             data = ole.openstream(sp).read()
-            # Only process MS-OVBA modules
-            if not data or data[0] != 0x01:
+            if not data:
                 continue
-            # Determine text offset
+            # Determine text offset (ModuleOffset)
             text_off = offsets_map.get(name)
             if text_off is None:
                 text_off = _guess_text_offset(data)
             if text_off is None:
                 continue
-            # Repack: keep only text region if it looks like valid VBA text
+            # Validate offset points to compression signature
+            if text_off < 0 or text_off >= len(data) or data[text_off] != 0x01:
+                continue
+            # Repack: decompress source text and rebuild as source-only
             try:
-                decomp = decompress_stream(data)
+                text_bytes = decompress_module_text(data, text_off)
             except Exception:
                 continue
-            if text_off < 0 or text_off > len(decomp):
-                continue
-            text_bytes = decomp[text_off:]
             # Sanity checks: start markers, low control chars
             head = text_bytes[:1024]
             looks_text = False
@@ -1231,12 +1239,15 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                     data = ole.openstream(list(sp_tuple)).read()
                 except Exception:
                     continue
-                if not data or data[0] != 0x01:
+                if not data:
                     continue
                 text_off = offsets_map.get(name)
                 if text_off is None:
                     text_off = _guess_text_offset(data)
                 if text_off is None:
+                    continue
+                # Validate offset points to compression signature
+                if text_off < 0 or text_off >= len(data) or data[text_off] != 0x01:
                     continue
                 patched = zero_pcode_region(data, text_off)
                 if patched != data:
@@ -1609,9 +1620,19 @@ def _structural_verify(xlsb_path: str) -> Dict[str, Any]:
             continue
         try:
             data = o.openstream(e).read()
-            if not data or data[0] != 0x01:
+            if not data:
                 continue
-            decomp = decompress_stream(data)
+            # Find text offset - either from offsets map or heuristic
+            text_off = offsets.get(name)
+            if text_off is None:
+                text_off = _guess_text_offset(data)
+            if text_off is None or text_off < 0 or text_off >= len(data):
+                continue
+            # Validate compression signature at offset
+            if data[text_off] != 0x01:
+                continue
+            # Decompress source text from offset
+            decomp = decompress_module_text(data, text_off)
         except Exception:
             decomp_ok = False
             continue

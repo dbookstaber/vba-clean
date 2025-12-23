@@ -15,42 +15,64 @@ This document captures implementation details, behaviors that differ slightly fr
 
 ## MS‑OVBA background and tolerant handling
 
-VBA module streams are stored in an "MS‑OVBA compressed container":
-- The first byte is the container signature (0x01).
-- The stream consists of chunks. Each chunk has a 2‑byte header with:
+### Module Stream Structure (per MS-OVBA 2.3.4.3)
+
+A VBA module stream consists of two parts:
+1. **PerformanceCache**: Raw binary P-code, size specified by `ModuleOffset` in the dir stream
+2. **CompressedContainer**: MS-OVBA compressed source text, starting at byte `ModuleOffset`
+
+The `CompressedContainer` begins with signature byte 0x01, followed by chunks.
+Each chunk has a 2‑byte header with:
   - Bit 15: compressed (1) vs uncompressed (0)
   - Bits 12..14: signature bits (typically 0b011 as per spec)
   - Bits 0..11: chunk size minus 3
 
-In the wild (notably Office 365/Office 16), we've observed streams that can:
-- Use non‑standard values for the header signature bits.
-- End with an uncompressed chunk shorter than 4096 bytes.
+### Clarifications from Microsoft (December 2025)
+
+Following direct correspondence with Microsoft regarding observed deviations:
+
+1. **Raw chunk size handling**: For intermediate uncompressed (raw) chunks, the Size field
+   should be assumed to be 4095 (implying 4096 bytes of data). Only the final raw chunk
+   may be shorter. The old VBA code hard-coded raw chunk size to 4095.
+
+2. **Signature bits for raw chunks**: While the spec says signature should be 0b011,
+   some producers emit different values for raw chunks. These should be accepted.
+
+3. **SRP streams** (`__SRP_*`): Per MS-OVBA 2.2.6, these MUST be ignored on read and
+   MUST NOT be present on write.
+
+### Our implementation
 
 To be robust, our decompressor and zeroing logic:
-- Verifies only the outer 0x01 container signature.
-- Accepts any chunk signature bits and bounds‑checks sizes.
-- Accepts short uncompressed chunks and copies/zeros only the available bytes.
+- For raw chunks: ignores the header Size field for intermediate chunks and assumes 4096 bytes
+- Verifies the 0x01 container signature at `ModuleOffset`, not at byte 0
+- Accepts any chunk signature bits and bounds‑checks sizes
+- Accepts short final uncompressed chunks
 
 This makes the tool resilient to variations while preserving the structure and avoiding false negatives.
 
 ## Heuristic patch (why/when/how)
 
-Normally, we parse the `VBA/dir` stream to recover each module's `ModuleOffset` (start of source text). We then zero the P‑code region (the decompressed bytes before that offset) within the compressed module stream, preserving the stream size.
+Normally, we parse the `VBA/dir` stream to recover each module's `ModuleOffset` (start of 
+compressed source text within the module stream). We then zero the PerformanceCache region 
+(the raw bytes before `ModuleOffset`) while preserving the CompressedContainer intact.
 
 Some files have irregular `dir` layouts or producer deviations that prevent a full parse. In that case, we:
 - Enumerate modules under `VBA/` to confirm macros exist.
-- Attempt a tolerant dir walk to salvage any offsets we can.
-- For remaining modules, heuristically guess the source start by searching for early source markers in the decompressed bytes (e.g., `Attribute VB_`, `Option Explicit`, `Sub `, `Function `), and use the earliest occurrence as a conservative boundary.
+- Attempt a tolerant byte-by-byte dir scan to salvage any offsets we can.
+- For remaining modules, heuristically guess `ModuleOffset` by scanning for the 0x01 
+  compression signature followed by valid VBA markers in the decompressed output.
 
-We only report "applied heuristic patch" if a module stream actually changes via this patch. The heuristic never alters the source text itself and is safe: Excel will regenerate P‑code transparently.
+We only report "applied heuristic patch" if a module stream actually changes via this patch. 
+The heuristic never alters the source text itself and is safe: Excel will regenerate P‑code transparently.
 
 ## Repack mode and Windows Structured Storage rebuild
 
 The `--repack` mode aims to rebuild each module as source‑only:
-- Decompress the module stream.
-- Keep only the source text region (from `ModuleOffset` to end).
-- Re‑emit an MS‑OVBA container that uses only uncompressed chunks (size can change).
-- Update the `VBA/dir` stream to set `ModuleOffset = 0` for repacked modules.
+- Get `ModuleOffset` from the dir stream (or heuristic)
+- Decompress source text from `ModuleOffset` using `decompress_module_text()`
+- Re‑emit an MS‑OVBA container containing only the source text (no PerformanceCache)
+- Update the `VBA/dir` stream to set `ModuleOffset = 0` for repacked modules
 
 Resizing OLE streams requires a proper Compound File (CFB) writer. Our strategy:
 1) Attempt in‑memory resized writes.

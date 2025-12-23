@@ -77,6 +77,10 @@ def _read_snapshot(path: str) -> Tuple[List[ModuleSnapshot], Dict[str, int]]:
         offsets = {m.stream_name: m.text_offset for m in parser.modules}
     except Exception:
         offsets = {}
+    
+    # If strict parser fails, try tolerant extraction
+    if not offsets:
+        offsets = vba_clean._extract_offsets_from_dir(dir_comp)
 
     # Enumerate module streams
     special = {"dir", "project", "_vba_project", "projectwm"}
@@ -86,18 +90,21 @@ def _read_snapshot(path: str) -> Tuple[List[ModuleSnapshot], Dict[str, int]]:
             if name.lower() in special:
                 continue
             data = ole.openstream(['VBA', name]).read()
-            if not data or data[0] != 0x01:
-                # Not an MS-OVBA stream; skip
+            if not data:
                 continue
-            try:
-                decomp = vba_clean.decompress_stream(data)
-            except Exception:
-                continue
+            # Determine text offset (ModuleOffset)
             off = offsets.get(name)
             if off is None:
-                off = vba_clean._guess_text_offset(data) or 0
-            off = max(0, min(off, len(decomp)))
-            text = decomp[off:]
+                off = vba_clean._guess_text_offset(data)
+            if off is None or off < 0 or off >= len(data):
+                continue
+            # Validate compression signature at offset
+            if data[off] != 0x01:
+                continue
+            try:
+                text = vba_clean.decompress_module_text(data, off)
+            except Exception:
+                continue
             mods.append(ModuleSnapshot(name=name, offset=offsets.get(name), text=text))
 
     ole.close()
