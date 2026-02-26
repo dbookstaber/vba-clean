@@ -241,6 +241,10 @@ class DirStreamParser:
                 break
             size = self._read_uint32(self.stream)
             payload = self.stream.read(size)
+            # PROJECTVERSION (0x0009) has a trailing 2-byte MinorVersion
+            # field that is NOT part of the standard TLV payload.
+            if record_id == 0x0009:
+                self.stream.read(2)  # skip MinorVersion
             if record_id == 0x0003 and size == 2:  # PROJECTCODEPAGE
                 cp_value = struct.unpack("<H", payload)[0]
                 self.codepage = self._resolve_codepage(cp_value)
@@ -286,6 +290,9 @@ class DirStreamParser:
                     chunk = self.stream.read(size)
                     if len(chunk) != size:
                         break
+                # PROJECTVERSION trailing MinorVersion (2 bytes)
+                if record_id == 0x0009:
+                    self.stream.read(2)
                 continue
 
             size = read_sz()
@@ -376,6 +383,53 @@ class DirStreamParser:
 # ---------------------------------------------------------------------------
 # P-code neutralisation
 # ---------------------------------------------------------------------------
+
+def _invalidate_performance_caches(ole: "olefile.OleFileIO") -> None:
+    """Zero __SRP_* streams and invalidate _VBA_PROJECT PerformanceCache.
+
+    After P-code is zeroed in module streams, the supplementary caches must
+    also be invalidated so that Excel sees a consistent "no compiled cache"
+    state and recompiles from source on next run.
+
+    Per MS-OVBA 2.2.6, SRP streams "MUST be ignored on read" and "MUST NOT
+    be present on write".  We zero their contents (same size) since olefile
+    cannot delete streams.
+
+    For _VBA_PROJECT (MS-OVBA 2.3.4.1), we keep the 5-byte header
+    (reserved1 + version + reserved2) but set version to 0x0001 and zero the
+    PerformanceCache bytes.  The version mismatch causes Excel to discard the
+    stale cache and recompile from source.
+    """
+    for entry in ole.listdir():
+        if len(entry) != 2 or entry[0].lower() != "vba":
+            continue
+        name = entry[1]
+
+        # Zero SRP stream contents
+        if name.lower().startswith("__srp_"):
+            try:
+                data = ole.openstream(entry).read()
+                if data and any(b != 0 for b in data):
+                    ole.write_stream(entry, b"\x00" * len(data))
+            except Exception:
+                pass
+
+        # Invalidate _VBA_PROJECT PerformanceCache
+        elif name.lower() == "_vba_project":
+            try:
+                data = ole.openstream(entry).read()
+                if len(data) >= 5:
+                    buf = bytearray(data)
+                    # Set version to 0x0001 (forces version-mismatch → cache discard)
+                    buf[2] = 0x01
+                    buf[3] = 0x00
+                    # Zero PerformanceCache (everything after the 5-byte header)
+                    for i in range(5, len(buf)):
+                        buf[i] = 0x00
+                    ole.write_stream(entry, bytes(buf))
+            except Exception:
+                pass
+
 
 def zero_pcode_region(module_stream: bytes, text_offset: int) -> bytes:
     """Return a new module stream with the PerformanceCache region zeroed.
@@ -732,7 +786,7 @@ def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List
         for entry in ole.listdir():
             if len(entry) == 2 and entry[0].lower() == "vba":
                 name = entry[1]
-                if name.lower() not in special:
+                if name.lower() not in special and not name.lower().startswith("__srp_"):
                     modules_seen.append(name)
 
         # Second fallback: try to parse dir_data in a forgiving way to recover offsets
@@ -831,6 +885,9 @@ def patch_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], List
             modifications[module.stream_name] = module.text_offset
             vba_changed = True
 
+    if vba_changed:
+        _invalidate_performance_caches(ole)
+
     ole.close()
     bio.seek(0)
     return bio.read(), modifications, modules_seen, parse_ok, vba_changed
@@ -881,11 +938,9 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
 
     # If strict dir parse failed (parse_ok == False), choose the safer path:
     # size-preserving neutralization of all modules based on recovered offsets,
-    # without altering dir offsets or dropping SRP/_VBA_PROJECT.
+    # then clean stale cache streams.
     if not parse_ok:
         neutral_writes: Dict[Tuple[str, str], bytes] = {}
-        repack_writes: Dict[Tuple[str, str], bytes] = {}
-        repack_names: Set[str] = set()
         for entry in ole.listdir():
             if len(entry) == 2 and entry[0].lower() == "vba":
                 name = entry[1]
@@ -934,85 +989,11 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                         neutral_writes[tuple(sp)] = patched
                         modifications[name] = off
                         vba_changed = True
-        # If any module changed, attempt a rebuild that omits caches (__SRP_* and _VBA_PROJECT)
-        if vba_changed and repack_names:
-            def _rebuild_without_caches_return_bytes() -> Optional[bytes]:
-                # Prefer pythoncom Structured Storage to create a fresh doc and omit caches
-                try:
-                    import pythoncom  # type: ignore
-                except Exception:
-                    return None
-                # Snapshot current streams
-                stream_map: Dict[Tuple[str, ...], bytes] = {}
-                # In this parse-fail path, we keep _VBA_PROJECT to satisfy stricter Excel builds
-                keep_vba_project = True
-                for ent in ole.listdir():
-                    try:
-                        data = ole.openstream(ent).read()
-                        if len(ent) == 2 and ent[0].lower() == 'vba':
-                            nm = ent[1]
-                            if nm.lower().startswith('__srp_'):
-                                continue
-                            if nm == '_VBA_PROJECT' and not keep_vba_project:
-                                continue
-                        stream_map[tuple(ent)] = data
-                    except Exception:
-                        continue
-                # Overlay module writes (neutral first, then repacks)
-                for sp_t, payload in neutral_writes.items():
-                    stream_map[sp_t] = payload
-                for sp_t, payload in repack_writes.items():
-                    stream_map[sp_t] = payload
-                # In parse-fail, skip dir update to avoid corruption since offsets_map is empty
-                import tempfile, os as _os
-                tmp_path = None
-                try:
-                    tmp = tempfile.NamedTemporaryFile(delete=False)
-                    tmp_path = tmp.name
-                    tmp.close()
-                    STGM_CREATE = 0x00001000
-                    STGM_READWRITE = 0x00000002
-                    STGM_SHARE_EXCLUSIVE = 0x00000010
-                    root = pythoncom.StgCreateDocfile(tmp_path, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0)
-                    storages: Dict[Tuple[str, ...], Any] = {(): root}
-                    def ensure_storage(path: Tuple[str, ...]):
-                        if path in storages:
-                            return storages[path]
-                        parent = ensure_storage(path[:-1]) if path[:-1] else storages[()]
-                        sub = parent.CreateStorage(path[-1], STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, 0)
-                        storages[path] = sub
-                        return sub
-                    for sp, data in stream_map.items():
-                        if len(sp) == 1:
-                            parent = storages[()]
-                            name = sp[0]
-                        else:
-                            parent = ensure_storage(sp[:-1])
-                            name = sp[-1]
-                        stm = parent.CreateStream(name, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, 0)
-                        mv = memoryview(data)
-                        pos = 0
-                        chunk = 1 << 20
-                        while pos < len(mv):
-                            stm.Write(mv[pos:pos+chunk])
-                            pos += chunk
-                        stm.Commit(0)
-                    root.Commit(0)
-                    with open(tmp_path, 'rb') as fh:
-                        return fh.read()
-                except Exception:
-                    return None
-                finally:
-                    if tmp_path and _os.path.exists(tmp_path):
-                        try:
-                            _os.remove(tmp_path)
-                        except Exception:
-                            pass
-
-            rebuilt = _rebuild_without_caches_return_bytes()
-            if rebuilt is not None:
-                ole.close()
-                return rebuilt, modifications, modules_seen, parse_ok, True
+        # Apply the neutral writes to the in-memory OLE
+        for sp_t, payload in neutral_writes.items():
+            ole.write_stream(list(sp_t), payload)
+        if vba_changed:
+            _invalidate_performance_caches(ole)
         ole.close()
         bio.seek(0)
         return bio.read(), modifications, modules_seen, parse_ok, vba_changed
@@ -1078,12 +1059,6 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
         new_dir_comp, dir_changed = _update_dir_offsets_to_zero(dir_comp, repacked_modules)
         if dir_changed:
             dir_replacement = new_dir_comp
-        # Detect SRP streams; if present, prefer full rebuild so we can omit them
-        srp_streams: List[Tuple[str, str]] = []
-        for entry in ole.listdir():
-            if len(entry) == 2 and entry[0].lower() == 'vba' and entry[1].lower().startswith('__srp_'):
-                srp_streams.append((entry[0], entry[1]))
-
         def try_apply_writes(o: "olefile.OleFileIO") -> Optional[Exception]:
             try:
                 # Apply module writes first
@@ -1096,103 +1071,18 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
             except Exception as e:  # catch and return to decide fallback
                 return e
         
-        # If SRP streams exist, skip in-place writes and go straight to rebuild to omit them
-        if srp_streams:
-            err = Exception('force rebuild to drop SRP')
-        else:
-            err = try_apply_writes(ole)
-            if err is None:
-                # In-memory resize succeeded
-                for (_, name), _payload in planned_writes.items():
-                    modifications[name] = 0
-                vba_changed = True
-                ole.close()
-                bio.seek(0)
-                return bio.read(), modifications, modules_seen, parse_ok, vba_changed
+        err = try_apply_writes(ole)
+        if err is None:
+            # In-memory resize succeeded
+            for (_, name), _payload in planned_writes.items():
+                modifications[name] = 0
+            vba_changed = True
+            _invalidate_performance_caches(ole)
+            ole.close()
+            bio.seek(0)
+            return bio.read(), modifications, modules_seen, parse_ok, vba_changed
         
         if err is not None:
-            # Try Windows Structured Storage rebuild (IStorage/IStream) if available
-            def _try_win32_rebuild() -> Optional[bytes]:
-                try:
-                    import pythoncom  # type: ignore
-                except Exception:
-                    return None
-                # Collect all stream bytes
-                stream_map: Dict[Tuple[str, ...], bytes] = {}
-                for entry in ole.listdir():
-                    try:
-                        data = ole.openstream(entry).read()
-                        # Omit SRP streams from rebuilt file
-                        if len(entry) == 2 and entry[0].lower() == 'vba' and entry[1].lower().startswith('__srp_'):
-                            continue
-                        # Also omit _VBA_PROJECT performance cache stream per spec (MUST NOT be present on write)
-                        if len(entry) == 2 and entry[0].lower() == 'vba' and entry[1] == '_VBA_PROJECT':
-                            continue
-                        stream_map[tuple(entry)] = data
-                    except Exception:
-                        # likely a storage, not a stream
-                        continue
-                # Apply replacements
-                for sp_tuple, payload in planned_writes.items():
-                    stream_map[sp_tuple] = payload
-                if dir_replacement is not None:
-                    stream_map[tuple(dir_stream_path)] = dir_replacement
-
-                import tempfile, os as _os
-                tmp_path = None
-                try:
-                    tmp = tempfile.NamedTemporaryFile(delete=False)
-                    tmp_path = tmp.name
-                    tmp.close()
-                    # STGM flags
-                    STGM_CREATE = 0x00001000
-                    STGM_READWRITE = 0x00000002
-                    STGM_SHARE_EXCLUSIVE = 0x00000010
-                    root = pythoncom.StgCreateDocfile(tmp_path, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0)
-                    # storage cache
-                    storages: Dict[Tuple[str, ...], Any] = {(): root}
-                    def ensure_storage(path: Tuple[str, ...]):
-                        if path in storages:
-                            return storages[path]
-                        parent = ensure_storage(path[:-1]) if path[:-1] else storages[()]
-                        sub = parent.CreateStorage(path[-1], STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, 0)
-                        storages[path] = sub
-                        return sub
-                    # Write streams
-                    for sp, data in stream_map.items():
-                        if len(sp) == 1:
-                            parent = storages[()]
-                            name = sp[0]
-                        else:
-                            parent = ensure_storage(sp[:-1])
-                            name = sp[-1]
-                        stm = parent.CreateStream(name, STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE, 0, 0)
-                        mv = memoryview(data)
-                        pos = 0
-                        chunk = 1 << 20
-                        while pos < len(mv):
-                            stm.Write(mv[pos:pos+chunk])
-                            pos += chunk
-                        stm.Commit(0)
-                    root.Commit(0)
-                    with open(tmp_path, 'rb') as fh:
-                        return fh.read()
-                except Exception:
-                    return None
-                finally:
-                    if tmp_path and _os.path.exists(tmp_path):
-                        try:
-                            _os.remove(tmp_path)
-                        except Exception:
-                            pass
-
-            rebuilt_bytes = _try_win32_rebuild()
-            if rebuilt_bytes is not None:
-                for (_, name), _payload in planned_writes.items():
-                    modifications[name] = 0
-                vba_changed = True
-                return rebuilt_bytes, modifications, modules_seen, parse_ok, vba_changed
-
             # Fallback: recreate using a temp file on disk
             ole.close()
             import tempfile
@@ -1204,16 +1094,15 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                 err2 = try_apply_writes(o2)
                 o2.close()
                 if err2 is None:
+                    # Invalidate caches in the temp-file OLE before reading back
+                    o3 = olefile.OleFileIO(tmp_path, write_mode=True)
+                    _invalidate_performance_caches(o3)
+                    o3.close()
                     with open(tmp_path, 'rb') as fh:
                         project_bytes = fh.read()
-                    # Mark modifications and flags based on planned writes
                     for (_, name), _payload in planned_writes.items():
                         modifications[name] = 0
                         vba_changed = True
-                    if dir_replacement is not None:
-                        # ensure parse_ok propagated above; nothing else to do
-                        pass
-                    # Return early with updated bytes
                     return project_bytes, modifications, modules_seen, parse_ok, True
                 else:
                     # Fall through to neutralization path below
@@ -1255,10 +1144,60 @@ def repack_vba_project(project_bytes: bytes) -> Tuple[bytes, Dict[str, int], Lis
                     modifications[name] = text_off
                     vba_changed = True
 
-    # If no planned resizes or after fallback neutralisation, finalise current in-memory OLE
+    if vba_changed:
+        _invalidate_performance_caches(ole)
+
     ole.close()
     bio.seek(0)
     return bio.read(), modifications, modules_seen, parse_ok, vba_changed
+
+
+def _fix_zip_metadata(zip_path: str, original_meta: Dict[str, Tuple[int, int]]) -> None:
+    """Patch local file header flag_bits in a written ZIP to match originals.
+
+    Python's zipfile.writestr() forcibly resets flag_bits to 0 and may alter
+    external_attr.  The central directory is fixed before close() via filelist
+    manipulation, but local file headers must be patched post-hoc.
+
+    ``original_meta`` maps filename → (flag_bits, external_attr).
+    """
+    with open(zip_path, "r+b") as fp:
+        while True:
+            sig = fp.read(4)
+            if sig != b"PK\x03\x04":
+                break
+            # Local file header layout (after 4-byte signature):
+            #   offset 2: version needed (2 bytes)
+            #   offset 4: flag_bits (2 bytes)  <-- we patch this
+            #   offset 6: compression method (2 bytes)
+            #   ... then more fields ...
+            #   offset 26: filename length (2 bytes)
+            #   offset 28: extra field length (2 bytes)
+            fp.read(2)  # version needed
+            flags_pos = fp.tell()
+            old_flags = struct.unpack("<H", fp.read(2))[0]
+            comp_method = struct.unpack("<H", fp.read(2))[0]
+            fp.read(16)  # mod time(2) + mod date(2) + crc(4) + comp_size(4) + uncomp_size(4)
+            fname_len = struct.unpack("<H", fp.read(2))[0]
+            extra_len = struct.unpack("<H", fp.read(2))[0]
+            fname = fp.read(fname_len).decode("utf-8", errors="replace")
+            if fname in original_meta:
+                orig_flags, _ = original_meta[fname]
+                if old_flags != orig_flags:
+                    fp.seek(flags_pos)
+                    fp.write(struct.pack("<H", orig_flags))
+            # Skip past extra field + compressed data to reach next header
+            fp.seek(flags_pos - 2)  # back to version needed
+            fp.read(2)  # version needed (again)
+            fp.read(2)  # flag_bits
+            fp.read(2)  # compression method
+            fp.read(4)  # mod time + date
+            fp.read(4)  # crc
+            comp_size = struct.unpack("<I", fp.read(4))[0]
+            fp.read(4)  # uncomp_size
+            fp.read(2)  # fname_len (already known)
+            fp.read(2)  # extra_len (already known)
+            fp.seek(fp.tell() + fname_len + extra_len + comp_size)
 
 
 def process_workbook(
@@ -1274,6 +1213,12 @@ def process_workbook(
     if in_place:
         tmp_output = input_path + ".tmp"
 
+    # Capture original ZIP metadata before writestr corrupts it
+    original_meta: Dict[str, Tuple[int, int]] = {}
+    with zipfile.ZipFile(input_path, "r") as zpre:
+        for zi in zpre.infolist():
+            original_meta[zi.filename] = (zi.flag_bits, zi.external_attr)
+
     with zipfile.ZipFile(input_path, "r") as zin, zipfile.ZipFile(tmp_output, "w") as zout:
         for item in zin.infolist():
             data = zin.read(item.filename)
@@ -1288,6 +1233,15 @@ def process_workbook(
                 parse_ok = parse_ok and this_parse_ok
                 vba_changed = vba_changed or this_changed
             zout.writestr(item, data)
+
+        # Restore original flag_bits and external_attr on filelist entries
+        # before close() writes the central directory
+        for zi in zout.filelist:
+            if zi.filename in original_meta:
+                zi.flag_bits, zi.external_attr = original_meta[zi.filename]
+
+    # Patch local file header flag_bits in the written file
+    _fix_zip_metadata(tmp_output, original_meta)
 
     if in_place:
         os.replace(tmp_output, input_path)
